@@ -102,8 +102,15 @@ python3 perf_comparator.py --mode report-only --config config.ini --replay workl
 只看单个 OB 的负载问题：
 
 ```bash
-python3 perf_comparator.py --mode source-report --config config.ini --duration 900
+python3 perf_comparator.py --mode source-report --config config.ini --duration 86400 --rolling-report-interval 300
 ```
+
+这个模式适合后台连续跑一天，报告会按固定周期刷新同一组 HTML/TXT/SQL 文件，持续给出：
+
+- Top caller groups
+- Top slow SQL
+- Top slow PL/SQL
+- 每条热点的可能原因
 
 ## 关键配置项
 
@@ -116,6 +123,8 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 - `hours`
 - `slowdown_threshold`
 - `plsql_profile`
+- `rolling_report_interval`
+- `source_actor_fields`
 
 可选外部诊断：
 
@@ -174,6 +183,24 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 报告里会标出每条 SQL 最终来自哪条链路。
 source-only HTML 里还会给出 SQL 来源分布图，帮助你判断当前环境究竟多依赖 OCP 还是本地视图回填。
 
+## 24 小时后台抓取建议
+
+推荐命令：
+
+```bash
+python3 perf_comparator.py --mode source-report --config config.ini --duration 86400 --rolling-report-interval 300
+```
+
+推荐配置：
+
+- `source_db_mode = oceanbase`
+- 配置 `[OCEANBASE_SOURCE]`
+- 配置 `[OCEANBASE_SOURCE_SYS]`，用于 OB 4.2.5 上回填 SQL 文本
+- `plsql_profile = true`，用于需要时抓取复杂包的行级热点
+- `source_actor_fields = tenant_name,db_name,user_name,user_client_ip`
+
+这样在多个测试部门同时压测时，最终报告会按 caller group 归类慢 SQL 和慢 PL/SQL，并尽量给出 RPC、分布式计划、热点代码块等原因。
+
 ## 产物
 
 `workloads/` 下常见文件：
@@ -197,7 +224,7 @@ source-only HTML 里还会给出 SQL 来源分布图，帮助你判断当前环�
 ```bash
 python3 -m py_compile perf_comparator.py test_perf_comparator.py
 python3 -m unittest -v
-openspec validate --type change add-optional-external-diagnostics --strict --no-interactive
+openspec validate --type change add-rolling-ob-source-diagnostics --strict --no-interactive
 ```
 
 ## 参考文档

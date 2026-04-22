@@ -371,6 +371,40 @@ class PerfComparatorConfigTests(unittest.TestCase):
             self.assertEqual(cfg.settings["ocp_cluster_name"], "observer147")
             self.assertEqual(cfg.settings["ocp_tenant_name"], "ob4ora")
 
+    def test_load_config_parses_rolling_source_report_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = app@test#obcluster
+                    password = source_secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    rolling_report_interval = 120
+                    source_actor_fields = tenant_name,db_name,user_name,user_client_ip
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(
+                str(config_path), execution_mode=perf_comparator.MODE_SOURCE_REPORT
+            )
+
+            self.assertEqual(cfg.settings["rolling_report_interval"], 120)
+            self.assertEqual(
+                cfg.settings["source_actor_fields"],
+                ["tenant_name", "db_name", "user_name", "user_client_ip"],
+            )
+
 
 class PerfComparatorUtilityTests(unittest.TestCase):
     def test_parse_oracle_dsn(self):
@@ -435,6 +469,64 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         )
         self.assertIsNone(rendered)
         self.assertIn("unsupported bind types", skip_reason)
+
+    def test_build_source_actor_key_uses_configured_fields(self):
+        row = {
+            "source_tenant_name": "ob4ora",
+            "source_db_name": "observer147",
+            "source_user_name": "QA_FINANCE",
+            "source_user_client_ip": "172.16.0.51",
+        }
+        actor_key = perf_comparator.build_source_actor_key(
+            row, ["tenant_name", "db_name", "user_name", "user_client_ip"]
+        )
+        self.assertIn("tenant_name=ob4ora", actor_key)
+        self.assertIn("user_name=QA_FINANCE", actor_key)
+
+    def test_maybe_refresh_source_report_regenerates_snapshot_when_due(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload.jsonl"
+            workload_path.write_text("{}", encoding="utf-8")
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={},
+                oceanbase_target={},
+                settings={
+                    "source_schemas": ["APP"],
+                    "report_dir": tmpdir,
+                    "workloads_dir": tmpdir,
+                    "rolling_report_interval": 60,
+                    "source_actor_fields": ["tenant_name", "db_name", "user_name", "user_client_ip"],
+                },
+                config_path="config.ini",
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "generate_report_from_source_workload",
+                return_value={"summary": Path(tmpdir) / "summary.txt"},
+            ) as report_mock, mock.patch.object(
+                perf_comparator.time,
+                "time",
+                return_value=180.0,
+            ):
+                refreshed_at = perf_comparator.maybe_refresh_source_report(
+                    config, workload_path, "20260422_rolling", 100.0
+                )
+
+        report_mock.assert_called_once()
+        self.assertEqual(refreshed_at, 180.0)
+
+    def test_build_source_ob_audit_query_with_caller_fields_has_no_trailing_comma(self):
+        query = perf_comparator._build_source_ob_audit_query(0)
+        self.assertIn("RET_CODE\n        FROM GV$OB_SQL_AUDIT", query)
+        self.assertNotIn("RET_CODE,\n        FROM GV$OB_SQL_AUDIT", query)
+        self.assertIn("TENANT_NAME", query)
+
+        legacy_query = perf_comparator._build_source_ob_audit_query(
+            0, include_caller_fields=False
+        )
+        self.assertNotIn("TENANT_NAME", legacy_query)
 
     def test_derive_replay_metrics_calculates_speedup_ratio(self):
         row = {
@@ -995,6 +1087,20 @@ class PerfComparatorOracleCaptureTests(unittest.TestCase):
         self.assertEqual(rows[0]["source_ob_block_cache_hit"], 90.0)
         self.assertEqual(rows[1]["sql_text"], "BEGIN pkg.run(); END")
 
+    def test_parse_ob_audit_rows_preserves_caller_attribution_fields(self):
+        stdout = (
+            "201\ttrace-201\tsql-201\t2400\t40\t30\t2300\t1200\t30\t3\t1\t1\t1\t2\t99\t95\t500\t80\t20\t6\tSELECT * FROM orders\tob4ora\tobserver147\tOMS_USER\t172.16.0.201\t10.10.1.5\t0"
+        )
+        rows = perf_comparator.parse_ob_audit_rows(stdout, "APP", captured_at="2026-04-22T20:00:00Z")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["source_tenant_name"], "ob4ora")
+        self.assertEqual(row["source_db_name"], "observer147")
+        self.assertEqual(row["source_user_name"], "OMS_USER")
+        self.assertEqual(row["source_user_client_ip"], "172.16.0.201")
+        self.assertEqual(row["source_client_ip"], "10.10.1.5")
+        self.assertEqual(row["source_ret_code"], 0.0)
+
     def test_parse_explain_plan_text_extracts_plan_rows(self):
         plan_text = textwrap.dedent(
             """
@@ -1190,6 +1296,55 @@ class PerfComparatorOracleCaptureTests(unittest.TestCase):
         aggregated = perf_comparator.aggregate_ob_source_workload_rows(rows)
 
         self.assertEqual(aggregated[0]["source_sql_text_source"], "captured")
+
+    def test_aggregate_source_workload_rows_tracks_primary_actor_and_plsql_type(self):
+        rows = [
+            {
+                "sql_id": "pkg-actor-1",
+                "sql_text": "BEGIN billing_pkg.run_close_day; END",
+                "source_execution_count": 3,
+                "baseline_avg_elapsed_us": 6000.0,
+                "oracle_avg_elapsed_us": 6000.0,
+                "source_ob_queue_time_us": 300.0,
+                "source_ob_get_plan_time_us": 50.0,
+                "source_ob_execute_time_us": 5650.0,
+                "source_ob_net_time_us": 2000.0,
+                "source_ob_plan_type_raw": "3",
+                "source_ob_is_hit_plan": "1",
+                "source_ob_is_executor_rpc": "1",
+                "source_tenant_name": "ob4ora",
+                "source_db_name": "observer147",
+                "source_user_name": "QA_FINANCE",
+                "source_user_client_ip": "172.16.0.51",
+            },
+            {
+                "sql_id": "pkg-actor-1",
+                "sql_text": "BEGIN billing_pkg.run_close_day; END",
+                "source_execution_count": 2,
+                "baseline_avg_elapsed_us": 5000.0,
+                "oracle_avg_elapsed_us": 5000.0,
+                "source_ob_queue_time_us": 200.0,
+                "source_ob_get_plan_time_us": 40.0,
+                "source_ob_execute_time_us": 4760.0,
+                "source_ob_net_time_us": 1800.0,
+                "source_ob_plan_type_raw": "3",
+                "source_ob_is_hit_plan": "1",
+                "source_ob_is_executor_rpc": "1",
+                "source_tenant_name": "ob4ora",
+                "source_db_name": "observer147",
+                "source_user_name": "QA_FINANCE",
+                "source_user_client_ip": "172.16.0.51",
+            },
+        ]
+
+        aggregated = perf_comparator.aggregate_ob_source_workload_rows(rows)
+
+        self.assertEqual(len(aggregated), 1)
+        row = aggregated[0]
+        self.assertEqual(row["source_workload_type"], "plsql")
+        self.assertEqual(row["source_primary_actor_count"], 5)
+        self.assertIn("QA_FINANCE", row["source_primary_actor"])
+        self.assertEqual(row["source_actor_count"], 1)
 
     def test_build_source_sqlstat_delta_rows_emits_missing_sql_ids(self):
         start_snapshot = {
@@ -3324,6 +3479,96 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn('id="sql-source-chart"', html_text)
             self.assertIn("ocp_native", html_text)
             self.assertIn("-- sql_text_recovery_detail: local=0 ocp_native=1 ocp_template=0", hints_text)
+
+    def test_source_report_surfaces_top_callers_and_separate_sql_plsql_sections(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_181000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                [
+                    {
+                        "sql_id": "sql-caller-1",
+                        "sql_text": "SELECT * FROM orders WHERE status = 'NEW'",
+                        "sql_text_normalized": "SELECT * FROM ORDERS WHERE STATUS = 'NEW'",
+                        "baseline_avg_elapsed_us": 1800.0,
+                        "oracle_avg_elapsed_us": 1800.0,
+                        "oracle_avg_logical_reads": 90.0,
+                        "source_ob_queue_time_us": 30.0,
+                        "source_ob_get_plan_time_us": 20.0,
+                        "source_ob_execute_time_us": 1750.0,
+                        "source_ob_net_time_us": 1000.0,
+                        "source_ob_plan_type_raw": "3",
+                        "source_ob_is_hit_plan": "1",
+                        "source_ob_is_executor_rpc": "0",
+                        "source_sql_text_source": "captured",
+                        "source_tenant_name": "ob4ora",
+                        "source_db_name": "observer147",
+                        "source_user_name": "QA_ORDERS",
+                        "source_user_client_ip": "172.16.1.10",
+                    },
+                    {
+                        "sql_id": "pkg-caller-1",
+                        "sql_text": "BEGIN settlement_pkg.run_close_day; END",
+                        "sql_text_normalized": "BEGIN SETTLEMENT_PKG.RUN_CLOSE_DAY; END",
+                        "baseline_avg_elapsed_us": 5200.0,
+                        "oracle_avg_elapsed_us": 5200.0,
+                        "oracle_avg_logical_reads": 40.0,
+                        "source_ob_queue_time_us": 200.0,
+                        "source_ob_get_plan_time_us": 60.0,
+                        "source_ob_execute_time_us": 4940.0,
+                        "source_ob_net_time_us": 2600.0,
+                        "source_ob_plan_type_raw": "3",
+                        "source_ob_is_hit_plan": "1",
+                        "source_ob_is_executor_rpc": "1",
+                        "source_sql_text_source": "captured",
+                        "source_tenant_name": "ob4ora",
+                        "source_db_name": "observer147",
+                        "source_user_name": "QA_FINANCE",
+                        "source_user_client_ip": "172.16.2.20",
+                        "plsql_profile_status": "ok",
+                        "plsql_profile_diagnosis_summary": "SETTLEMENT_PKG:88-95:row_by_row_sql_in_loop",
+                    },
+                ],
+            )
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.1",
+                    "port": "2881",
+                    "user_string": "root@test#obcluster",
+                    "password": "secret",
+                },
+                oceanbase_target={},
+                settings={
+                    "source_db_mode": "oceanbase",
+                    "source_schemas": ["APP"],
+                    "workloads_dir": tmpdir,
+                    "report_dir": str(report_dir),
+                    "top_n": 50,
+                    "slowdown_threshold": 0.8,
+                    "source_actor_fields": ["tenant_name", "db_name", "user_name", "user_client_ip"],
+                },
+                config_path="config.ini",
+            )
+
+            report_paths = perf_comparator.generate_report_from_source_workload(
+                config, workload_path, "20260422_201000"
+            )
+
+            summary_text = Path(report_paths["summary"]).read_text(encoding="utf-8")
+            html_text = Path(report_paths["html"]).read_text(encoding="utf-8")
+            hints_text = Path(report_paths["hints"]).read_text(encoding="utf-8")
+            self.assertIn("Top caller groups:", summary_text)
+            self.assertIn("Top slow SQL:", summary_text)
+            self.assertIn("Top slow PL/SQL:", summary_text)
+            self.assertIn("QA_FINANCE", summary_text)
+            self.assertIn("SETTLEMENT_PKG:88-95:row_by_row_sql_in_loop", summary_text)
+            self.assertIn('id="top-caller-groups"', html_text)
+            self.assertIn('id="slow-plsql-section"', html_text)
+            self.assertIn("-- top_callers:", hints_text)
+            self.assertIn("-- slow_plsql:", hints_text)
 
 
 class PerfComparatorDocumentationTests(unittest.TestCase):

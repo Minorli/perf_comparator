@@ -53,6 +53,7 @@ DEFAULT_HOURS = 24
 DEFAULT_TIMEOUT_FACTOR = 3.0
 DEFAULT_SLOWDOWN_THRESHOLD = 0.8
 DEFAULT_INTERVAL = 60
+DEFAULT_ROLLING_REPORT_INTERVAL = 300
 DEFAULT_AUDIT_POLL_MS = 300
 DEFAULT_OBCLIENT_TIMEOUT = 120
 DEFAULT_OB_SESSION_QUERY_TIMEOUT_US = 3600000000
@@ -62,6 +63,7 @@ DEFAULT_OCP_TIMEOUT = 15
 DEFAULT_OBDIAG_TIMEOUT = 120
 SOURCE_TEXT_CR_SENTINEL = "\x1e"
 SOURCE_TEXT_LF_SENTINEL = "\x1f"
+DEFAULT_SOURCE_ACTOR_FIELDS = ["tenant_name", "db_name", "user_name", "user_client_ip"]
 
 SECTION_ORACLE_SOURCE = "ORACLE_SOURCE"
 SECTION_OCEANBASE_SOURCE = "OCEANBASE_SOURCE"
@@ -359,6 +361,15 @@ def normalize_schema_list(value):
     return [item.strip().upper() for item in str(value).split(",") if item.strip()]
 
 
+def normalize_csv_list(value):
+    # type: (Any) -> List[str]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
 def _get_required_section(parser, section_name):
     # type: (configparser.ConfigParser, str) -> configparser.SectionProxy
     if not parser.has_section(section_name):
@@ -461,6 +472,9 @@ def load_config(config_path, execution_mode=None):
         "min_exec": _get_optional_int(settings_section, "min_exec", DEFAULT_MIN_EXEC),
         "hours": _get_optional_int(settings_section, "hours", DEFAULT_HOURS),
         "interval": _get_optional_int(settings_section, "interval", DEFAULT_INTERVAL),
+        "rolling_report_interval": _get_optional_int(
+            settings_section, "rolling_report_interval", DEFAULT_ROLLING_REPORT_INTERVAL
+        ),
         "audit_poll_ms": _get_optional_int(
             settings_section, "audit_poll_ms", DEFAULT_AUDIT_POLL_MS
         ),
@@ -513,6 +527,12 @@ def load_config(config_path, execution_mode=None):
         "obdiag_executable": (settings_section.get("obdiag_executable") or "").strip(),
         "obdiag_timeout": _get_optional_int(settings_section, "obdiag_timeout", DEFAULT_OBDIAG_TIMEOUT),
         "obdiag_extra_args": (settings_section.get("obdiag_extra_args") or "").strip(),
+        "source_actor_fields": normalize_csv_list(
+            settings_section.get(
+                "source_actor_fields", ",".join(DEFAULT_SOURCE_ACTOR_FIELDS)
+            )
+        )
+        or list(DEFAULT_SOURCE_ACTOR_FIELDS),
     }
 
     return AppConfig(
@@ -770,20 +790,29 @@ def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
         if len(fields) < 15:
             continue
         format_kind = "legacy"
-        if len(fields) >= 21:
+        if len(fields) >= 27:
+            format_kind = "source425ctx"
+        elif len(fields) >= 21:
             format_kind = "source425"
         elif len(fields) >= 19:
             format_kind = "rich"
-        retry_idx = 13 if format_kind == "source425" else (12 if format_kind == "rich" else None)
-        table_scan_idx = 12 if format_kind == "source425" else None
-        row_cache_hit_idx = 14 if format_kind == "source425" else None
-        block_cache_hit_idx = 15 if format_kind == "source425" else None
-        memstore_idx = 16 if format_kind == "source425" else (13 if format_kind == "rich" else None)
-        ssstore_idx = 17 if format_kind == "source425" else (14 if format_kind == "rich" else None)
+        is_source425 = format_kind in ("source425", "source425ctx")
+        retry_idx = 13 if is_source425 else (12 if format_kind == "rich" else None)
+        table_scan_idx = 12 if is_source425 else None
+        row_cache_hit_idx = 14 if is_source425 else None
+        block_cache_hit_idx = 15 if is_source425 else None
+        memstore_idx = 16 if is_source425 else (13 if format_kind == "rich" else None)
+        ssstore_idx = 17 if is_source425 else (14 if format_kind == "rich" else None)
         bloom_idx = 15 if format_kind == "rich" else None
-        logical_idx = 18 if format_kind == "source425" else (16 if format_kind == "rich" else 12)
-        physical_idx = 19 if format_kind == "source425" else (17 if format_kind == "rich" else 13)
-        sql_text_idx = 20 if format_kind == "source425" else (18 if format_kind == "rich" else 14)
+        logical_idx = 18 if is_source425 else (16 if format_kind == "rich" else 12)
+        physical_idx = 19 if is_source425 else (17 if format_kind == "rich" else 13)
+        sql_text_idx = 20 if is_source425 else (18 if format_kind == "rich" else 14)
+        tenant_name_idx = 21 if format_kind == "source425ctx" else None
+        db_name_idx = 22 if format_kind == "source425ctx" else None
+        user_name_idx = 23 if format_kind == "source425ctx" else None
+        user_client_ip_idx = 24 if format_kind == "source425ctx" else None
+        client_ip_idx = 25 if format_kind == "source425ctx" else None
+        ret_code_idx = 26 if format_kind == "source425ctx" else None
         sql_id = fields[2] or compute_sql_id(fields[sql_text_idx])
         sql_text = fields[sql_text_idx]
         rows.append(
@@ -825,9 +854,113 @@ def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
                 "source_ob_bloom_filter_filtered": _safe_float(fields[bloom_idx]) if bloom_idx is not None else None,
                 "source_ob_logical_reads": _safe_float(fields[logical_idx]),
                 "source_ob_physical_reads": _safe_float(fields[physical_idx]),
+                "source_tenant_name": fields[tenant_name_idx] if tenant_name_idx is not None else "",
+                "source_db_name": fields[db_name_idx] if db_name_idx is not None else "",
+                "source_user_name": fields[user_name_idx] if user_name_idx is not None else "",
+                "source_user_client_ip": fields[user_client_ip_idx] if user_client_ip_idx is not None else "",
+                "source_client_ip": fields[client_ip_idx] if client_ip_idx is not None else "",
+                "source_ret_code": _safe_float(fields[ret_code_idx]) if ret_code_idx is not None else None,
             }
         )
     return rows
+
+
+def classify_source_workload_type(sql_text):
+    # type: (Any) -> str
+    return "plsql" if is_plsql_statement(str(sql_text or "")) else "sql"
+
+
+def get_source_actor_fields(config_or_settings):
+    # type: (Any) -> List[str]
+    if isinstance(config_or_settings, dict):
+        settings = config_or_settings
+    else:
+        settings = getattr(config_or_settings, "settings", {}) or {}
+    actor_fields = normalize_csv_list(settings.get("source_actor_fields"))
+    return actor_fields or list(DEFAULT_SOURCE_ACTOR_FIELDS)
+
+
+def build_source_actor_key(row, actor_fields):
+    # type: (Dict[str, Any], Sequence[str]) -> str
+    parts = []
+    for field_name in actor_fields:
+        key = "source_%s" % str(field_name or "").strip().lower()
+        value = str(row.get(key) or row.get(field_name) or "").strip()
+        if value:
+            parts.append("%s=%s" % (field_name, value))
+    if not parts:
+        fallback_values = [
+            ("schema", str(row.get("schema") or "").strip()),
+            ("sql_id", str(row.get("sql_id") or "").strip()),
+        ]
+        parts = ["%s=%s" % (name, value) for name, value in fallback_values if value]
+    return " | ".join(parts) or "unattributed"
+
+
+def summarize_source_likely_cause(row):
+    # type: (Dict[str, Any]) -> str
+    plsql_diagnosis = summarize_plsql_profile_diagnosis(row)
+    if plsql_diagnosis != "n/a":
+        return plsql_diagnosis
+    recommendations = row.get("recommendations") or []
+    if recommendations:
+        rule_ids = [str(item.get("rule_id") or "").strip() for item in recommendations if str(item.get("rule_id") or "").strip()]
+        if rule_ids:
+            return ",".join(rule_ids[:3])
+    plan_risk = summarize_plan_diff_signals(row)
+    if plan_risk != "n/a":
+        return plan_risk
+    net_ratio = row.get("net_ratio")
+    if net_ratio is not None and float(net_ratio or 0.0) > 0.6:
+        return "network_heavy"
+    return "n/a"
+
+
+def compute_source_actor_summaries(rows):
+    # type: (List[Dict[str, Any]]) -> List[Dict[str, Any]]
+    grouped = {}
+    for row in rows:
+        actor_key = str(row.get("source_primary_actor") or "").strip() or "unattributed"
+        entry = grouped.get(actor_key)
+        if entry is None:
+            entry = {
+                "actor": actor_key,
+                "statement_count": 0,
+                "sql_count": 0,
+                "plsql_count": 0,
+                "sample_count": 0,
+                "total_elapsed_us": 0.0,
+                "max_avg_elapsed_us": 0.0,
+            }
+            grouped[actor_key] = entry
+        entry["statement_count"] += 1
+        entry["sample_count"] += int(row.get("source_sample_count") or 0)
+        entry["total_elapsed_us"] += float(row.get("source_total_elapsed_us") or 0.0)
+        entry["max_avg_elapsed_us"] = max(entry["max_avg_elapsed_us"], float(row.get("ob_elapsed_us") or 0.0))
+        if str(row.get("source_workload_type") or "sql") == "plsql":
+            entry["plsql_count"] += 1
+        else:
+            entry["sql_count"] += 1
+    return sorted(
+        grouped.values(),
+        key=lambda item: (-float(item.get("total_elapsed_us") or 0.0), -int(item.get("sample_count") or 0), str(item.get("actor") or "")),
+    )
+
+
+def maybe_refresh_source_report(config, workload_path, run_id, last_refresh_at, force=False):
+    # type: (AppConfig, Union[str, Path], str, float, bool) -> float
+    refresh_interval = int(config.settings.get("rolling_report_interval", DEFAULT_ROLLING_REPORT_INTERVAL) or 0)
+    if refresh_interval <= 0:
+        return float(last_refresh_at or 0.0)
+    now = time.time()
+    if not force and now - float(last_refresh_at or 0.0) < refresh_interval:
+        return float(last_refresh_at or 0.0)
+    if not Path(workload_path).exists():
+        return float(last_refresh_at or 0.0)
+    rolling_config = clone_app_config(config, settings_updates={"_rolling_source_report": True})
+    generate_report_from_source_workload(rolling_config, workload_path, run_id)
+    LOG.info("Rolling source report refreshed: run_id=%s", run_id)
+    return now
 
 
 def get_source_sql_lookup_ob_cfg(config):
@@ -3829,8 +3962,19 @@ def _capture_from_awr(connection, config):
     return rows
 
 
-def _build_source_ob_audit_query(last_request_id):
-    # type: (int) -> str
+def _build_source_ob_audit_query(last_request_id, include_caller_fields=True):
+    # type: (int, bool) -> str
+    extra_fields = []
+    if include_caller_fields:
+        extra_fields = [
+            "TENANT_NAME",
+            "DB_NAME",
+            "USER_NAME",
+            "USER_CLIENT_IP",
+            "CLIENT_IP",
+            "RET_CODE",
+        ]
+    extra_fields_sql = "".join("\n          , %s" % field for field in extra_fields)
     return """
         SELECT /* perf_comparator_source_poll */
           REQUEST_ID,
@@ -3853,11 +3997,11 @@ def _build_source_ob_audit_query(last_request_id):
           SSSTORE_READ_ROW_COUNT,
           RETURN_ROWS,
           DISK_READS,
-          QUERY_SQL
+          QUERY_SQL{extra_fields}
         FROM GV$OB_SQL_AUDIT
         WHERE REQUEST_ID > {last_request_id}
         ORDER BY REQUEST_ID
-    """.format(last_request_id=int(last_request_id))
+    """.format(last_request_id=int(last_request_id), extra_fields=extra_fields_sql)
 
 
 def _obclient_run_sql_on_source(config, sql_text, timeout=None, session_query_timeout_us=0):
@@ -3904,22 +4048,30 @@ def capture_workload_from_ob_source(config, args, run_id):
     started = time.time()
     window_started_at = datetime.now(timezone.utc)
     last_request_id = 0
+    last_report_refresh_at = 0.0
     captured_sql_ids = set()
     source_sqlstat_start = {}
+    query_profile = str(config.settings.get("_source_audit_query_profile") or "rich").strip() or "rich"
     if getattr(args, "mode", None) == MODE_SOURCE_REPORT:
         source_sqlstat_start = collect_source_sqlstat_snapshot(config)
         last_request_id = get_source_max_request_id(config)
     default_schema = config.settings["source_schemas"][0]
     while True:
+        include_caller_fields = query_profile != "legacy"
         ok, stdout, stderr = _obclient_run_sql_on_source(
             config,
-            _build_source_ob_audit_query(last_request_id),
+            _build_source_ob_audit_query(last_request_id, include_caller_fields=include_caller_fields),
             timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
             session_query_timeout_us=config.settings.get(
                 "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
             ),
         )
         if not ok:
+            if include_caller_fields and ("ORA-00904" in str(stderr or stdout).upper() or "UNKNOWN COLUMN" in str(stderr or stdout).upper()):
+                LOG.warning("Source audit caller fields unavailable; falling back to legacy audit query")
+                query_profile = "legacy"
+                config.settings["_source_audit_query_profile"] = "legacy"
+                continue
             if time.time() - started >= duration:
                 break
             LOG.warning("OceanBase source audit polling failed: %s", stderr or stdout)
@@ -3930,6 +4082,10 @@ def capture_workload_from_ob_source(config, args, run_id):
             append_jsonl(workload_path, rows)
             captured_sql_ids.update(str(row.get("sql_id") or "") for row in rows if row.get("sql_id"))
             last_request_id = max(int(row.get("source_ob_request_id") or 0) for row in rows)
+            if getattr(args, "mode", None) == MODE_SOURCE_REPORT:
+                last_report_refresh_at = maybe_refresh_source_report(
+                    config, workload_path, run_id, last_report_refresh_at
+                )
         if time.time() - started >= duration:
             break
         time.sleep(poll_interval)
@@ -3954,6 +4110,9 @@ def capture_workload_from_ob_source(config, args, run_id):
         )
         if plan_cache_rows:
             append_jsonl(workload_path, plan_cache_rows)
+        last_report_refresh_at = maybe_refresh_source_report(
+            config, workload_path, run_id, last_report_refresh_at, force=True
+        )
     if not workload_path.exists():
         raise ConfigError("OceanBase source capture did not produce any workload rows")
     return workload_path
@@ -3978,6 +4137,9 @@ def aggregate_ob_source_workload_rows(workload_rows):
                 float(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us") or 0.0)
                 * sample_increment
             )
+        actor_fields = row.get("source_actor_fields") or list(DEFAULT_SOURCE_ACTOR_FIELDS)
+        actor_key = build_source_actor_key(row, actor_fields)
+        workload_type = classify_source_workload_type(sql_text)
         key = str(row.get("sql_id") or compute_sql_id(sql_text))
         entry = grouped.get(key)
         if entry is None:
@@ -4009,6 +4171,22 @@ def aggregate_ob_source_workload_rows(workload_rows):
                 "source_ob_plan_type_raw": row.get("source_ob_plan_type_raw"),
                 "captured_at": row.get("captured_at"),
                 "source_sql_text_source": row.get("source_sql_text_source") or row.get("source_sql_text_status"),
+                "source_actor_counts": {},
+                "source_actor_fields": list(actor_fields),
+                "source_workload_type": workload_type,
+                "source_tenant_name": row.get("source_tenant_name"),
+                "source_db_name": row.get("source_db_name"),
+                "source_user_name": row.get("source_user_name"),
+                "source_user_client_ip": row.get("source_user_client_ip"),
+                "source_client_ip": row.get("source_client_ip"),
+                "source_ret_code": row.get("source_ret_code"),
+                "source_first_seen_at": row.get("captured_at"),
+                "source_last_seen_at": row.get("captured_at"),
+                "plsql_profile_status": row.get("plsql_profile_status"),
+                "plsql_profile_summary": row.get("plsql_profile_summary"),
+                "plsql_profile_mapping_summary": row.get("plsql_profile_mapping_summary"),
+                "plsql_profile_diagnosis_summary": row.get("plsql_profile_diagnosis_summary"),
+                "plsql_profile_diagnoses": row.get("plsql_profile_diagnoses") or [],
             }
             grouped[key] = entry
         entry["source_sample_count"] += sample_increment
@@ -4033,6 +4211,19 @@ def aggregate_ob_source_workload_rows(workload_rows):
         entry["source_total_bloom_filter_filtered"] += float(row.get("source_ob_bloom_filter_filtered") or 0.0) * sample_increment
         entry["source_plan_miss_count"] += 0 if _is_truthy_flag(row.get("source_ob_is_hit_plan")) else sample_increment
         entry["source_rpc_count"] += sample_increment if _is_truthy_flag(row.get("source_ob_is_executor_rpc")) else 0
+        entry["source_actor_counts"][actor_key] = int(entry["source_actor_counts"].get(actor_key, 0) or 0) + sample_increment
+        if workload_type == "plsql":
+            entry["source_workload_type"] = "plsql"
+        if row.get("plsql_profile_status") and not entry.get("plsql_profile_status"):
+            entry["plsql_profile_status"] = row.get("plsql_profile_status")
+        if row.get("plsql_profile_summary") and not entry.get("plsql_profile_summary"):
+            entry["plsql_profile_summary"] = row.get("plsql_profile_summary")
+        if row.get("plsql_profile_mapping_summary") and not entry.get("plsql_profile_mapping_summary"):
+            entry["plsql_profile_mapping_summary"] = row.get("plsql_profile_mapping_summary")
+        if row.get("plsql_profile_diagnosis_summary") and not entry.get("plsql_profile_diagnosis_summary"):
+            entry["plsql_profile_diagnosis_summary"] = row.get("plsql_profile_diagnosis_summary")
+        if row.get("plsql_profile_diagnoses") and not entry.get("plsql_profile_diagnoses"):
+            entry["plsql_profile_diagnoses"] = row.get("plsql_profile_diagnoses") or []
         request_id = _safe_int(row.get("source_ob_request_id"))
         current_request_id = _safe_int(entry.get("source_ob_request_id"))
         if request_id is not None and (current_request_id is None or request_id >= current_request_id):
@@ -4040,6 +4231,17 @@ def aggregate_ob_source_workload_rows(workload_rows):
             entry["source_ob_trace_id"] = row.get("source_ob_trace_id")
             entry["source_ob_plan_type_raw"] = row.get("source_ob_plan_type_raw")
             entry["captured_at"] = row.get("captured_at")
+            entry["source_tenant_name"] = row.get("source_tenant_name")
+            entry["source_db_name"] = row.get("source_db_name")
+            entry["source_user_name"] = row.get("source_user_name")
+            entry["source_user_client_ip"] = row.get("source_user_client_ip")
+            entry["source_client_ip"] = row.get("source_client_ip")
+            entry["source_ret_code"] = row.get("source_ret_code")
+            entry["source_last_seen_at"] = row.get("captured_at")
+        first_seen = str(entry.get("source_first_seen_at") or "")
+        row_seen = str(row.get("captured_at") or "")
+        if row_seen and (not first_seen or row_seen < first_seen):
+            entry["source_first_seen_at"] = row_seen
         row_source = str(row.get("source_sql_text_source") or row.get("source_sql_text_status") or "").strip() or "missing"
         entry_source = str(entry.get("source_sql_text_source") or "").strip() or "missing"
         if source_priority.get(row_source, 0) >= source_priority.get(entry_source, 0):
@@ -4048,6 +4250,13 @@ def aggregate_ob_source_workload_rows(workload_rows):
     aggregated_rows = []
     for entry in grouped.values():
         sample_count = max(1, int(entry.get("source_sample_count") or 1))
+        actor_counts = entry.get("source_actor_counts") or {}
+        sorted_actor_counts = sorted(
+            actor_counts.items(),
+            key=lambda item: (-int(item[1] or 0), item[0]),
+        )
+        primary_actor = sorted_actor_counts[0][0] if sorted_actor_counts else "unattributed"
+        primary_actor_count = int(sorted_actor_counts[0][1] or 0) if sorted_actor_counts else 0
         aggregated = {
             "sql_id": entry.get("sql_id"),
             "sql_text": entry.get("sql_text"),
@@ -4077,6 +4286,28 @@ def aggregate_ob_source_workload_rows(workload_rows):
             "source_ob_trace_id": entry.get("source_ob_trace_id"),
             "source_ob_request_id": entry.get("source_ob_request_id"),
             "source_sql_text_source": entry.get("source_sql_text_source"),
+            "source_workload_type": entry.get("source_workload_type") or classify_source_workload_type(entry.get("sql_text")),
+            "source_actor_fields": entry.get("source_actor_fields") or list(DEFAULT_SOURCE_ACTOR_FIELDS),
+            "source_actor_count": len(sorted_actor_counts),
+            "source_primary_actor": primary_actor,
+            "source_primary_actor_count": primary_actor_count,
+            "source_actor_summaries": [
+                {"actor": actor, "count": int(count)}
+                for actor, count in sorted_actor_counts[:5]
+            ],
+            "source_first_seen_at": entry.get("source_first_seen_at"),
+            "source_last_seen_at": entry.get("source_last_seen_at") or entry.get("captured_at"),
+            "source_tenant_name": entry.get("source_tenant_name"),
+            "source_db_name": entry.get("source_db_name"),
+            "source_user_name": entry.get("source_user_name"),
+            "source_user_client_ip": entry.get("source_user_client_ip"),
+            "source_client_ip": entry.get("source_client_ip"),
+            "source_ret_code": entry.get("source_ret_code"),
+            "plsql_profile_status": entry.get("plsql_profile_status"),
+            "plsql_profile_summary": entry.get("plsql_profile_summary"),
+            "plsql_profile_mapping_summary": entry.get("plsql_profile_mapping_summary"),
+            "plsql_profile_diagnosis_summary": entry.get("plsql_profile_diagnosis_summary"),
+            "plsql_profile_diagnoses": entry.get("plsql_profile_diagnoses") or [],
             "plan_monitor_rows": [],
         }
         aggregated.update(derive_replay_metrics(aggregated))
@@ -5514,6 +5745,10 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     ]
     if not workload_rows:
         raise ConfigError("Source workload only contained internal perf_comparator source queries")
+    actor_fields = get_source_actor_fields(config)
+    for row in workload_rows:
+        if not row.get("source_actor_fields"):
+            row["source_actor_fields"] = list(actor_fields)
     enriched_rows = aggregate_ob_source_workload_rows(workload_rows)
     if not enriched_rows:
         raise ConfigError("Source workload did not produce any reportable rows")
@@ -5522,9 +5757,11 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     )
     missing_sql_stmt_count = max(0, len(enriched_rows) - visible_sql_stmt_count)
     sql_source_counts = compute_sql_text_source_distribution(enriched_rows)
+    actor_summaries = compute_source_actor_summaries(enriched_rows)
+    rolling_mode = bool(config.settings.get("_rolling_source_report"))
     slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
     for row in enriched_rows:
-        if should_collect_plan_monitor(row, slowdown_threshold):
+        if not rolling_mode and should_collect_plan_monitor(row, slowdown_threshold):
             try:
                 row["plan_monitor_rows"] = collect_source_plan_monitor_rows(config, row)
             except Exception:
@@ -5547,7 +5784,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     selected_rows = enriched_rows[:top_n]
     materialized_selected_rows = []
     for row in selected_rows:
-        if has_external_diagnostics_config(config) and _should_collect_external_row_diagnostics(row, slowdown_threshold):
+        if (not rolling_mode) and has_external_diagnostics_config(config) and _should_collect_external_row_diagnostics(row, slowdown_threshold):
             try:
                 row = _merge_external_diagnostics(
                     row,
@@ -5561,6 +5798,8 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     summary_path = build_artifact_path("report_summary", run_id, root_dir=report_dir)
     html_path = build_artifact_path("report_html", run_id, root_dir=report_dir)
     hints_path = build_artifact_path("report_hints", run_id, root_dir=report_dir)
+    top_sql_rows = [row for row in selected_rows if str(row.get("source_workload_type") or "sql") != "plsql"][:5]
+    top_plsql_rows = [row for row in selected_rows if str(row.get("source_workload_type") or "sql") == "plsql"][:5]
 
     summary_lines = [
         "Run ID: %s" % run_id,
@@ -5583,9 +5822,74 @@ def generate_report_from_source_workload(config, workload_path, run_id):
             int(sql_source_counts.get("ocp_native", 0)),
             int(sql_source_counts.get("ocp_template", 0)),
         ),
+        "Observed caller groups: %d (fields=%s)"
+        % (
+            len(actor_summaries),
+            ",".join(get_source_actor_fields(config)),
+        ),
+        "Observed workload types: sql=%d plsql=%d"
+        % (
+            sum(1 for row in enriched_rows if str(row.get("source_workload_type") or "sql") != "plsql"),
+            sum(1 for row in enriched_rows if str(row.get("source_workload_type") or "sql") == "plsql"),
+        ),
         "",
-        "Top hotspots:",
+        "Top caller groups:",
     ]
+    for idx, actor in enumerate(actor_summaries[:5], 1):
+        summary_lines.append(
+            "%d. actor=%s samples=%s total_elapsed_us=%s statements=%s sql=%s plsql=%s"
+            % (
+                idx,
+                actor.get("actor"),
+                actor.get("sample_count"),
+                int(actor.get("total_elapsed_us") or 0.0),
+                actor.get("statement_count"),
+                actor.get("sql_count"),
+                actor.get("plsql_count"),
+            )
+        )
+    summary_lines.extend(
+        [
+            "",
+            "Top slow SQL:",
+        ]
+    )
+    for idx, row in enumerate(top_sql_rows, 1):
+        summary_lines.append(
+            "%d. actor=%s sql_id=%s avg_elapsed_us=%s cause=%s sql=%s"
+            % (
+                idx,
+                row.get("source_primary_actor") or "unattributed",
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                summarize_source_likely_cause(row),
+                build_sql_preview(row.get("sql_text"), limit=120),
+            )
+        )
+    summary_lines.extend(
+        [
+            "",
+            "Top slow PL/SQL:",
+        ]
+    )
+    for idx, row in enumerate(top_plsql_rows, 1):
+        summary_lines.append(
+            "%d. actor=%s sql_id=%s avg_elapsed_us=%s cause=%s sql=%s"
+            % (
+                idx,
+                row.get("source_primary_actor") or "unattributed",
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                summarize_source_likely_cause(row),
+                build_sql_preview(row.get("sql_text"), limit=120),
+            )
+        )
+    summary_lines.extend(
+        [
+            "",
+        "Top hotspots:",
+        ]
+    )
     if missing_sql_stmt_count > 0:
         summary_lines.append(
             "SQL text note: ordinary users may not see QUERY_SQL on OB 4.2.5; configure [%s] and enable _enable_sql_audit_query_sql=true."
@@ -5596,16 +5900,19 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
         external_summary = summarize_external_diagnostics(row)
         summary_line = (
-            "%d. sql_id=%s samples=%s avg_elapsed_us=%s total_elapsed_us=%s rules=%s monitor=%s plan_risk=%s"
+            "%d. sql_id=%s type=%s actor=%s samples=%s avg_elapsed_us=%s total_elapsed_us=%s rules=%s monitor=%s plan_risk=%s cause=%s"
             % (
                 idx,
                 row.get("sql_id"),
+                row.get("source_workload_type") or "sql",
+                row.get("source_primary_actor") or "unattributed",
                 row.get("source_sample_count"),
                 row.get("ob_elapsed_us"),
                 row.get("source_total_elapsed_us"),
                 rule_ids,
                 summarize_plan_monitor_evidence(row),
                 summarize_plan_diff_signals(row),
+                summarize_source_likely_cause(row),
             )
         )
         if external_summary != "n/a":
@@ -5624,6 +5931,9 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     for row in selected_rows:
         external_summary = summarize_external_diagnostics(row)
         evidence_parts = [
+            "actor=%s" % (row.get("source_primary_actor") or "unattributed"),
+            "type=%s" % (row.get("source_workload_type") or "sql"),
+            "cause=%s" % summarize_source_likely_cause(row),
             "monitor=%s" % summarize_plan_monitor_evidence(row),
             "plan-risk=%s" % summarize_plan_diff_signals(row),
             "queue_us=%s" % row.get("ob_queue_time_us"),
@@ -5649,6 +5959,37 @@ def generate_report_from_source_workload(config, workload_path, run_id):
                 sql=html.escape(build_sql_preview(row.get("sql_text"), limit=400)),
             )
         )
+    caller_rows_html = "".join(
+        "<tr><td>{actor}</td><td>{samples}</td><td>{elapsed}</td><td>{statements}</td><td>{sql_count}</td><td>{plsql_count}</td></tr>".format(
+            actor=html.escape(str(actor.get("actor"))),
+            samples=html.escape(str(actor.get("sample_count"))),
+            elapsed=html.escape(str(int(actor.get("total_elapsed_us") or 0.0))),
+            statements=html.escape(str(actor.get("statement_count"))),
+            sql_count=html.escape(str(actor.get("sql_count"))),
+            plsql_count=html.escape(str(actor.get("plsql_count"))),
+        )
+        for actor in actor_summaries[:8]
+    )
+    slow_sql_rows_html = "".join(
+        "<tr><td>{actor}</td><td>{sql_id}</td><td>{elapsed}</td><td>{cause}</td><td><pre>{sql}</pre></td></tr>".format(
+            actor=html.escape(str(row.get("source_primary_actor") or "unattributed")),
+            sql_id=html.escape(str(row.get("sql_id"))),
+            elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            cause=html.escape(summarize_source_likely_cause(row)),
+            sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
+        )
+        for row in top_sql_rows
+    )
+    slow_plsql_rows_html = "".join(
+        "<tr><td>{actor}</td><td>{sql_id}</td><td>{elapsed}</td><td>{cause}</td><td><pre>{sql}</pre></td></tr>".format(
+            actor=html.escape(str(row.get("source_primary_actor") or "unattributed")),
+            sql_id=html.escape(str(row.get("sql_id"))),
+            elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            cause=html.escape(summarize_source_likely_cause(row)),
+            sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
+        )
+        for row in top_plsql_rows
+    )
     charts_html = _render_svg_distribution_chart(enriched_rows, "source-distribution-chart")
     charts_html += _render_svg_sql_source_chart(sql_source_counts, "sql-source-chart")
     charts_html += _render_svg_timing_chart(selected_rows, "source-timing-chart", source_only=True)
@@ -5666,14 +6007,36 @@ pre { white-space: pre-wrap; margin: 0; }
 <h1>perf_comparator source-only report</h1>
 <p>Run ID: %s</p>
 <p>Mode: source-only</p>
+<p>Caller fields: %s</p>
 %s
+<div id="top-caller-groups" class="chart-block">
+<h2>Top Caller Groups</h2>
+<table><thead><tr><th>Actor</th><th>Samples</th><th>Total Elapsed (us)</th><th>Statements</th><th>SQL</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
+</div>
+<div id="slow-sql-section" class="chart-block">
+<h2>Top Slow SQL</h2>
+<table><thead><tr><th>Actor</th><th>SQL ID</th><th>Avg Elapsed (us)</th><th>Cause</th><th>SQL</th></tr></thead><tbody>%s</tbody></table>
+</div>
+<div id="slow-plsql-section" class="chart-block">
+<h2>Top Slow PL/SQL</h2>
+<table><thead><tr><th>Actor</th><th>SQL ID</th><th>Avg Elapsed (us)</th><th>Cause</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
+</div>
 <table>
 <thead><tr><th>SQL ID</th><th>Samples</th><th>Avg Elapsed (us)</th><th>Total Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
 <tbody>%s</tbody></table></body></html>
-""" % (html.escape(run_id), charts_html, "".join(html_rows))
+""" % (
+        html.escape(run_id),
+        html.escape(",".join(get_source_actor_fields(config))),
+        charts_html,
+        caller_rows_html,
+        slow_sql_rows_html,
+        slow_plsql_rows_html,
+        "".join(html_rows),
+    )
     write_text(html_path, html_content)
 
     hints_lines = ["-- perf_comparator source-only recommendations", "-- run_id: %s" % run_id, ""]
+    hints_lines.append("-- caller_fields: %s" % ",".join(get_source_actor_fields(config)))
     hints_lines.append(
         "-- sql_text_coverage: visible=%s total=%s row_backfilled=%s row_missing=%s via=%s"
         % (
@@ -5698,9 +6061,48 @@ pre { white-space: pre-wrap; margin: 0; }
             % SECTION_OCEANBASE_SOURCE_SYS
         )
     hints_lines.append("")
+    hints_lines.append("-- top_callers:")
+    for actor in actor_summaries[:5]:
+        hints_lines.append(
+            "-- actor=%s samples=%s total_elapsed_us=%s statements=%s sql=%s plsql=%s"
+            % (
+                actor.get("actor"),
+                actor.get("sample_count"),
+                int(actor.get("total_elapsed_us") or 0.0),
+                actor.get("statement_count"),
+                actor.get("sql_count"),
+                actor.get("plsql_count"),
+            )
+        )
+    hints_lines.append("-- slow_sql:")
+    for row in top_sql_rows:
+        hints_lines.append(
+            "-- actor=%s sql_id=%s avg_elapsed_us=%s cause=%s"
+            % (
+                row.get("source_primary_actor") or "unattributed",
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                summarize_source_likely_cause(row),
+            )
+        )
+    hints_lines.append("-- slow_plsql:")
+    for row in top_plsql_rows:
+        hints_lines.append(
+            "-- actor=%s sql_id=%s avg_elapsed_us=%s cause=%s"
+            % (
+                row.get("source_primary_actor") or "unattributed",
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                summarize_source_likely_cause(row),
+            )
+        )
+    hints_lines.append("")
     for row in selected_rows:
         hints_lines.append("-- sql_id: %s" % row.get("sql_id"))
         hints_lines.append("-- samples: %s" % row.get("source_sample_count"))
+        hints_lines.append("-- actor: %s" % (row.get("source_primary_actor") or "unattributed"))
+        hints_lines.append("-- workload_type: %s" % (row.get("source_workload_type") or "sql"))
+        hints_lines.append("-- cause: %s" % summarize_source_likely_cause(row))
         hints_lines.append(
             "-- sql_text_source: %s"
             % (row.get("source_sql_text_source") or row.get("source_sql_text_status") or "unknown")
@@ -6140,6 +6542,12 @@ def build_argument_parser():
     )
     parser.add_argument("--interval", type=int, default=None, help="Override stream poll interval")
     parser.add_argument(
+        "--rolling-report-interval",
+        type=int,
+        default=None,
+        help="Override rolling source-report refresh interval in seconds (0 disables live refresh)",
+    )
+    parser.add_argument(
         "--audit-poll-ms", type=int, default=None, help="Override SQL Audit poll interval in ms"
     )
     parser.add_argument(
@@ -6165,6 +6573,7 @@ def apply_cli_overrides(config, args):
         "timeout_factor": args.timeout_factor,
         "slowdown_threshold": args.slowdown_threshold,
         "interval": args.interval,
+        "rolling_report_interval": getattr(args, "rolling_report_interval", None),
         "audit_poll_ms": args.audit_poll_ms,
         "wcr_path": getattr(args, "wcr_path", None),
     }

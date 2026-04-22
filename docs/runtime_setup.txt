@@ -66,6 +66,13 @@ perf_comparator runtime setup
   - or pass `--wcr-path` on the command line
   - used as a fallback when AWR, V$SQL, and Unified Audit are unavailable
 
+- Rolling source-report controls:
+  - [SETTINGS]
+  - rolling_report_interval = 300
+  - source_actor_fields = tenant_name,db_name,user_name,user_client_ip
+  - `rolling_report_interval = 0` disables live report refresh
+  - `source_actor_fields` defines how caller groups are built for testing-team attribution
+
 - Optional external diagnostics:
   - `plsql_profile = true`
     - on first use the runtime will attempt `CALL DBMS_PROFILER.OB_INIT_OBJECTS(FALSE);`
@@ -134,7 +141,13 @@ perf_comparator runtime setup
   - recommended:
     - `[OCEANBASE_SOURCE_SYS]` for SQL text backfill on OB 4.2.5
   - example:
-    - python3 perf_comparator.py --mode source-report --config config.ini --duration 900
+    - python3 perf_comparator.py --mode source-report --config config.ini --duration 86400 --rolling-report-interval 300
+  - while capture is running, the runtime refreshes the same report paths so operators can watch the current 24-hour hotspot view
+  - source-only reports now surface:
+    - top caller groups
+    - top slow SQL
+    - top slow PL/SQL
+    - likely cause summaries for each hotspot
   - when SQL text is hidden from ordinary users, the summary and hints will show a coverage note and recommend enabling `_enable_sql_audit_query_sql=true`
   - SQL text recovery order is:
     - captured `QUERY_SQL`
