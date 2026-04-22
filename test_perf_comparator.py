@@ -249,6 +249,51 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["oracle_avg_elapsed_us"], 1200.0)
         self.assertEqual(rows[1]["sql_text"], "BEGIN pkg.run(); END")
 
+    def test_parse_explain_plan_text_extracts_plan_rows(self):
+        plan_text = textwrap.dedent(
+            """
+            ==============================================
+            |ID|OPERATOR              |NAME             |
+            ----------------------------------------------
+            |0 |PX COORDINATOR        |                 |
+            |1 | HASH JOIN            |                 |
+            |2 |  TABLE SCAN          |ORDERS           |
+            |3 |  TABLE LOOKUP        |ORDER_ITEMS      |
+            ==============================================
+            """
+        )
+        rows = perf_comparator.parse_explain_plan_text(plan_text)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["id"], 0)
+        self.assertEqual(rows[2]["operator"], "TABLE SCAN")
+        self.assertEqual(rows[3]["name"], "ORDER_ITEMS")
+
+    def test_build_recommendations_handles_plan_miss_lock_hot_and_plsql(self):
+        row = {
+            "sql_text": "BEGIN pkg.run(); END",
+            "ob_status": "ok",
+            "speedup_ratio": 0.4,
+            "net_ratio": 0.7,
+            "plan_changed": False,
+            "ob_is_executor_rpc": "1",
+            "ob_queue_time_us": 900.0,
+            "ob_execute_time_us": 200.0,
+            "ob_retry_cnt": 2,
+            "ob_is_hit_plan": "0",
+            "ob_get_plan_time_us": 300.0,
+            "ob_elapsed_us": 1000.0,
+            "ob_memstore_read_rows": 800.0,
+            "ob_ssstore_read_rows": 100.0,
+            "ob_bloom_filter_filtered": 0.0,
+        }
+        recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
+        rule_ids = [item["rule_id"] for item in recommendations]
+        self.assertIn("DIST-JOIN", rule_ids)
+        self.assertIn("PLSQL-RPC", rule_ids)
+        self.assertIn("LOCK-HOT", rule_ids)
+        self.assertIn("PLAN-MISS", rule_ids)
+        self.assertIn("LSM-JITTER", rule_ids)
+
 
 class PerfComparatorObclientTests(unittest.TestCase):
     def test_build_obclient_command_args_hides_password(self):

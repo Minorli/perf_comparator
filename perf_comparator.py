@@ -67,6 +67,13 @@ ARTIFACT_SPECS = {
     "report_hints": ("perf_hints", ".sql"),
 }
 
+PLAN_TYPE_NAMES = {
+    "1": "LOCAL",
+    "2": "REMOTE",
+    "3": "DISTRIBUTED",
+    "4": "UNCERTAIN",
+}
+
 LOG = logging.getLogger("perf_comparator")
 _SECURE_FILES = set()  # type: ignore[var-annotated]
 _SECURE_FILES_LOCK = threading.Lock()
@@ -130,6 +137,10 @@ class SQLAuditCollector(object):
               IS_EXECUTOR_RPC,
               LOGICAL_READ_COUNT,
               PHYSICAL_READ_COUNT,
+              RETRY_CNT,
+              MEMSTORE_READ_ROW_COUNT,
+              SSSTORE_READ_ROW_COUNT,
+              BLOOM_FILTER_FILTERED_COUNT,
               SQL_TEXT
             FROM GV$OB_SQL_AUDIT
             WHERE REQUEST_ID > {last_request_id}
@@ -169,6 +180,10 @@ class SQLAuditCollector(object):
                 "ob_logical_reads": _safe_float(fields[12]),
                 "ob_physical_reads": _safe_float(fields[13]),
                 "sql_text": fields[14],
+                "ob_retry_cnt": _safe_float(fields[15]) if len(fields) > 15 else None,
+                "ob_memstore_read_rows": _safe_float(fields[16]) if len(fields) > 16 else None,
+                "ob_ssstore_read_rows": _safe_float(fields[17]) if len(fields) > 17 else None,
+                "ob_bloom_filter_filtered": _safe_float(fields[18]) if len(fields) > 18 else None,
                 "captured_at": utc_now_iso(),
             }
             rows.append(row)
@@ -210,6 +225,24 @@ class SQLAuditCollector(object):
         # type: (str) -> Dict[str, Any]
         normalized = normalize_sql_text(rendered_sql)
         with self._lock:
+            candidates = [
+                row
+                for row in self._rows
+                if normalized and normalized in normalize_sql_text(row.get("sql_text", ""))
+            ]
+        if not candidates:
+            return {}
+        return sorted(candidates, key=lambda item: item.get("request_id") or 0)[-1]
+
+    def match_for_workload(self, workload_row, rendered_sql):
+        # type: (Dict[str, Any], str) -> Dict[str, Any]
+        sql_id = str(workload_row.get("sql_id") or "")
+        normalized = normalize_sql_text(rendered_sql)
+        with self._lock:
+            if sql_id:
+                exact = [row for row in self._rows if str(row.get("sql_id") or "") == sql_id]
+                if exact:
+                    return sorted(exact, key=lambda item: item.get("request_id") or 0)[-1]
             candidates = [
                 row
                 for row in self._rows
@@ -595,8 +628,33 @@ def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
                 "source_ob_net_time_us": _safe_float(fields[7]),
                 "source_ob_net_wait_time_us": _safe_float(fields[8]),
                 "source_ob_plan_type_raw": fields[9],
+                "source_ob_plan_type": PLAN_TYPE_NAMES.get(str(fields[9]), str(fields[9])),
                 "source_ob_is_hit_plan": fields[10],
                 "source_ob_is_executor_rpc": fields[11],
+            }
+        )
+    return rows
+
+
+def parse_explain_plan_text(plan_text):
+    # type: (str) -> List[Dict[str, Any]]
+    rows = []
+    for line in (plan_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or stripped.startswith("|ID|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        if not cells[0].isdigit():
+            continue
+        operator = cells[1]
+        name = cells[2] if len(cells) > 2 else ""
+        rows.append(
+            {
+                "id": int(cells[0]),
+                "operator": operator,
+                "name": name,
             }
         )
     return rows
@@ -672,6 +730,11 @@ def derive_replay_metrics(row):
     )
     ob_reads = float(row.get("ob_logical_reads") or 0.0)
     ob_net = float(row.get("ob_net_time_us") or 0.0)
+    ob_get_plan = float(row.get("ob_get_plan_time_us") or 0.0)
+    queue_time = float(row.get("ob_queue_time_us") or 0.0)
+    execute_time = float(row.get("ob_execute_time_us") or 0.0)
+    memstore_rows = float(row.get("ob_memstore_read_rows") or 0.0)
+    ssstore_rows = float(row.get("ob_ssstore_read_rows") or 0.0)
     speedup_ratio = None
     if oracle_elapsed > 0.0 and ob_elapsed > 0.0:
         speedup_ratio = oracle_elapsed / ob_elapsed
@@ -681,23 +744,51 @@ def derive_replay_metrics(row):
     net_ratio = None
     if ob_elapsed > 0.0:
         net_ratio = ob_net / ob_elapsed
+    plan_miss_ratio = None
+    if ob_elapsed > 0.0:
+        plan_miss_ratio = ob_get_plan / ob_elapsed
+    queue_execute_ratio = None
+    if execute_time > 0.0:
+        queue_execute_ratio = queue_time / execute_time
+    lsm_memstore_ratio = None
+    if (memstore_rows + ssstore_rows) > 0.0:
+        lsm_memstore_ratio = memstore_rows / (memstore_rows + ssstore_rows)
     return {
         "speedup_ratio": speedup_ratio,
         "read_amplification": read_amplification,
         "net_ratio": net_ratio,
+        "plan_miss_ratio": plan_miss_ratio,
+        "queue_execute_ratio": queue_execute_ratio,
+        "lsm_memstore_ratio": lsm_memstore_ratio,
         "plan_changed": bool(
             row.get("oracle_plan_hash")
             and row.get("ob_plan_hash")
             and str(row.get("oracle_plan_hash")) != str(row.get("ob_plan_hash"))
         ),
+        "ob_plan_type": PLAN_TYPE_NAMES.get(str(row.get("ob_plan_type_raw") or ""), str(row.get("ob_plan_type_raw") or "") or None),
     }
 
 
 def build_recommendations(row, slowdown_threshold):
     # type: (Dict[str, Any], float) -> List[Dict[str, str]]
     recommendations = []
+    derived = derive_replay_metrics(row)
     speedup_ratio = row.get("speedup_ratio")
+    if speedup_ratio is None:
+        speedup_ratio = derived.get("speedup_ratio")
     net_ratio = row.get("net_ratio")
+    if net_ratio is None:
+        net_ratio = derived.get("net_ratio")
+    plan_miss_ratio = row.get("plan_miss_ratio")
+    if plan_miss_ratio is None:
+        plan_miss_ratio = derived.get("plan_miss_ratio")
+    queue_execute_ratio = row.get("queue_execute_ratio")
+    if queue_execute_ratio is None:
+        queue_execute_ratio = derived.get("queue_execute_ratio")
+    lsm_memstore_ratio = row.get("lsm_memstore_ratio")
+    if lsm_memstore_ratio is None:
+        lsm_memstore_ratio = derived.get("lsm_memstore_ratio")
+    sql_text = str(row.get("sql_text") or "")
     if row.get("ob_status") not in (None, "", "ok"):
         if row.get("ob_status") == "skip":
             recommendations.append(
@@ -731,6 +822,61 @@ def build_recommendations(row, slowdown_threshold):
                 "hint_sql": (
                     "-- Consider table-group alignment or co-location for frequent joins\n"
                     "-- CREATE TABLEGROUP <group_name>;"
+                ),
+            }
+        )
+    if (
+        net_ratio is not None
+        and net_ratio > 0.6
+        and ("BEGIN" in sql_text.upper() or "DECLARE" in sql_text.upper() or "PACKAGE" in sql_text.upper() or "PKG." in sql_text.upper())
+        and str(row.get("ob_is_executor_rpc") or "").strip() in ("1", "True", "true", "YES", "yes")
+    ):
+        recommendations.append(
+            {
+                "rule_id": "PLSQL-RPC",
+                "message": "PL/SQL or package execution appears to trigger executor RPC overhead",
+                "hint_sql": (
+                    "-- Review row-by-row package logic and convert to set-based SQL or batch processing\n"
+                    "-- Consider FORALL or MERGE style rewrites where applicable"
+                ),
+            }
+        )
+    if (
+        str(row.get("ob_is_hit_plan") or "").strip() in ("0", "False", "false", "NO", "no")
+        and plan_miss_ratio is not None
+        and plan_miss_ratio > 0.2
+    ):
+        recommendations.append(
+            {
+                "rule_id": "PLAN-MISS",
+                "message": "Plan acquisition cost is high and plan cache does not appear to be hit",
+                "hint_sql": (
+                    "-- Refresh statistics, normalize SQL text, and inspect plan cache churn\n"
+                    "-- Consider plan binding or outline stabilization for hot statements"
+                ),
+            }
+        )
+    if queue_execute_ratio is not None and queue_execute_ratio > 3.0 and float(row.get("ob_retry_cnt") or 0.0) > 0.0:
+        recommendations.append(
+            {
+                "rule_id": "LOCK-HOT",
+                "message": "Queueing dominates execution and retry count is non-zero, suggesting lock contention",
+                "hint_sql": (
+                    "-- Investigate SELECT FOR UPDATE hot rows and add NOWAIT or retry backoff where appropriate"
+                ),
+            }
+        )
+    if (
+        lsm_memstore_ratio is not None
+        and lsm_memstore_ratio > 0.7
+        and float(row.get("ob_bloom_filter_filtered") or 0.0) <= 0.0
+    ):
+        recommendations.append(
+            {
+                "rule_id": "LSM-JITTER",
+                "message": "Memstore reads dominate and bloom filtering does not appear to help",
+                "hint_sql": (
+                    "-- Reduce batch size, inspect compaction timing, and review SSTable pruning effectiveness"
                 ),
             }
         )
@@ -1472,6 +1618,68 @@ def _query_recent_audit_row(config, rendered_sql):
     }
 
 
+def _query_recent_audit_row_by_sql_id(config, sql_id, rendered_sql):
+    # type: (AppConfig, str, str) -> Dict[str, Any]
+    if not sql_id:
+        return _query_recent_audit_row(config, rendered_sql)
+    query = """
+        SELECT * FROM (
+          SELECT
+            REQUEST_ID,
+            ELAPSED_TIME,
+            QUEUE_TIME,
+            GET_PLAN_TIME,
+            EXECUTE_TIME,
+            NET_TIME,
+            NET_WAIT_TIME,
+            PLAN_TYPE,
+            IS_HIT_PLAN,
+            IS_EXECUTOR_RPC,
+            LOGICAL_READ_COUNT,
+            PHYSICAL_READ_COUNT,
+            RETRY_CNT,
+            MEMSTORE_READ_ROW_COUNT,
+            SSSTORE_READ_ROW_COUNT,
+            BLOOM_FILTER_FILTERED_COUNT
+          FROM GV$OB_SQL_AUDIT
+          WHERE SQL_ID = '{sql_id}'
+          ORDER BY REQUEST_ID DESC
+        ) WHERE ROWNUM = 1
+    """.format(sql_id=str(sql_id).replace("'", "''"))
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout:
+        return _query_recent_audit_row(config, rendered_sql)
+    fields = stdout.splitlines()[0].split("\t")
+    if len(fields) < 16:
+        return _query_recent_audit_row(config, rendered_sql)
+    return {
+        "request_id": fields[0],
+        "ob_elapsed_us": _safe_float(fields[1]),
+        "ob_queue_time_us": _safe_float(fields[2]),
+        "ob_get_plan_time_us": _safe_float(fields[3]),
+        "ob_execute_time_us": _safe_float(fields[4]),
+        "ob_net_time_us": _safe_float(fields[5]),
+        "ob_net_wait_time_us": _safe_float(fields[6]),
+        "ob_plan_type_raw": fields[7],
+        "ob_is_hit_plan": fields[8],
+        "ob_is_executor_rpc": fields[9],
+        "ob_logical_reads": _safe_float(fields[10]),
+        "ob_physical_reads": _safe_float(fields[11]),
+        "ob_retry_cnt": _safe_float(fields[12]),
+        "ob_memstore_read_rows": _safe_float(fields[13]),
+        "ob_ssstore_read_rows": _safe_float(fields[14]),
+        "ob_bloom_filter_filtered": _safe_float(fields[15]),
+        "sql_text": rendered_sql,
+    }
+
+
 def _safe_float(value):
     # type: (Any) -> Optional[float]
     if value in (None, ""):
@@ -1522,6 +1730,7 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
     ok, stdout, stderr = backend.execute(config, rendered_sql, timeout_seconds)
     wall_time_us = (time.perf_counter() - start_perf) * 1000000.0
     explain_ok, explain_stdout, explain_stderr = backend.explain(config, rendered_sql)
+    plan_rows = parse_explain_plan_text(explain_stdout if explain_ok else "")
     audit_row = {}
     if audit_collector is not None:
         audit_collector.collect_once()
@@ -1547,6 +1756,7 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
         "ob_logical_reads": _safe_float(audit_row.get("ob_logical_reads")),
         "ob_physical_reads": _safe_float(audit_row.get("ob_physical_reads")),
         "ob_plan_text": explain_stdout if explain_ok else "",
+        "ob_plan_rows": plan_rows,
         "ob_plan_error": explain_stderr if not explain_ok else "",
         "ob_plan_hash": compute_sql_id(explain_stdout) if explain_ok and explain_stdout else None,
         "replayed_at": started_at,
@@ -1660,7 +1870,14 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 speedup=html.escape(_format_ratio(row.get("speedup_ratio"))),
                 oracle=html.escape(str(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us"))),
                 ob=html.escape(str(row.get("ob_elapsed_us"))),
-                rules=html.escape(",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"),
+                rules=html.escape(
+                    "%s | plan=%s | type=%s"
+                    % (
+                        ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none",
+                        " > ".join(plan_row.get("operator", "") for plan_row in row.get("ob_plan_rows", [])[:4]) or "n/a",
+                        row.get("ob_plan_type") or "n/a",
+                    )
+                ),
                 sql=html.escape(str(row.get("sql_text") or "")),
             )
         )
