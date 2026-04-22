@@ -79,7 +79,7 @@ perf_comparator runtime setup
       - `ocp_cluster_id = <clusterId>` and `ocp_tenant_id = <tenantId>`
       - or `ocp_cluster_name = <clusterName>` and `ocp_tenant_name = <tenantName>`
     - `ocp_verify_tls = false` if the deployment currently requires `curl -k`
-    - the runtime will query official OCP SQL endpoints such as `topSql`, `slowSql`, and `sql/{sqlId}/text`
+    - the runtime will query official OCP SQL endpoints such as `topSql`, `slowSql`, `sql/{sqlId}/text`, and `sqls/{sqlId}/trends`
     - the runtime generates `Authorization: Basic <base64(username:password)>` automatically when username/password mode is used
     - when IDs are absent, the runtime resolves them through `/api/v2/ob/clusters`
   - `ocp_ash_url_template` / `ocp_qpm_url_template`
@@ -141,3 +141,4 @@ perf_comparator runtime setup
     - `[OCEANBASE_SOURCE_SYS]` lookup
     - native OCP SQL text lookup
     - template-based OCP fallback
+  - the HTML report now includes a SQL text source distribution chart, and the summary or hints outputs state which recovery path was used

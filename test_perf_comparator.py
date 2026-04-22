@@ -1646,6 +1646,86 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
             self.assertTrue(any("/api/v2/ob/clusters/8/tenants/19/slowSql" in url for url in requested_urls))
             self.assertTrue(any("/api/v2/ob/clusters/8/tenants/19/sql/A1B2C3/text" in url for url in requested_urls))
 
+    def test_collect_external_row_diagnostics_fetches_native_ocp_trends_and_target_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._build_config()
+            config.settings.update(
+                {
+                    "report_dir": tmpdir,
+                    "ocp_base_url": "https://ocp.tidba.com:3600",
+                    "ocp_username": "admin",
+                    "ocp_password": "PAssw0rd01##",
+                    "ocp_cluster_name": "observer147",
+                    "ocp_tenant_name": "ob4ora",
+                    "ocp_verify_tls": False,
+                    "ocp_window_minutes": 30,
+                    "ocp_query_limit": 10,
+                }
+            )
+            row = {
+                "sql_id": "sql-1",
+                "sql_text": "SELECT * FROM orders WHERE status = 'ACTIVE'",
+                "replayed_at": "2026-04-22T10:00:00Z",
+                "ob_status": "ok",
+                "ob_elapsed_us": 3000.0,
+            }
+            requested_urls = []
+
+            class _FakeResponse(object):
+                def __init__(self, payload):
+                    self.payload = payload
+
+                def read(self):
+                    return self.payload.encode("utf-8")
+
+            def _urlopen(request, timeout=None, context=None):
+                url = request.full_url
+                requested_urls.append(url)
+                if url.endswith("/api/v2/ob/clusters"):
+                    return _FakeResponse(
+                        json.dumps(
+                            {
+                                "data": {
+                                    "contents": [
+                                        {
+                                            "id": 11,
+                                            "name": "observer147",
+                                            "tenants": [{"id": 36, "name": "ob4ora"}],
+                                        }
+                                    ]
+                                }
+                            }
+                        )
+                    )
+                if "topSql" in url:
+                    return _FakeResponse(
+                        json.dumps(
+                            {"data": {"contents": [{"sqlId": "A1B2C3", "sqlText": row["sql_text"]}]}}
+                        )
+                    )
+                if "slowSql" in url:
+                    return _FakeResponse(json.dumps({"data": {"contents": []}}))
+                if "/sql/A1B2C3/text" in url:
+                    return _FakeResponse(json.dumps({"data": {"sqlText": row["sql_text"]}}))
+                if "/sqls/A1B2C3/trends" in url:
+                    return _FakeResponse(
+                        json.dumps({"data": {"contents": [{"timestamp": "2026-04-22T10:00:00Z", "avgElapsedTime": 1234}]}})
+                    )
+                raise AssertionError("unexpected url: %s" % url)
+
+            with mock.patch.object(
+                perf_comparator.urllib.request,
+                "urlopen",
+                side_effect=_urlopen,
+            ):
+                result = perf_comparator.collect_external_row_diagnostics(config, row, "20260422_200101")
+
+            self.assertEqual(result["ocp"]["status"], "ok")
+            self.assertIn("cluster=11", result["ocp"]["summary"])
+            self.assertIn("tenant=36", result["ocp"]["summary"])
+            self.assertTrue(any("/api/v2/ob/clusters" in url for url in requested_urls))
+            self.assertTrue(any("/sqls/A1B2C3/trends" in url for url in requested_urls))
+
 
 class PerfComparatorRealDbValidationTests(unittest.TestCase):
     def test_run_realdb_verification_writes_summary(self):
@@ -2678,6 +2758,82 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn('id="overview-charts"', html_text)
             self.assertIn('id="source-distribution-chart"', html_text)
             self.assertIn('id="source-timing-chart"', html_text)
+
+    def test_source_report_mode_surfaces_sql_text_source_distribution(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_180000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                [
+                    {
+                        "sql_id": "sql-1",
+                        "sql_text": "SELECT * FROM orders",
+                        "sql_text_normalized": "SELECT * FROM ORDERS",
+                        "baseline_avg_elapsed_us": 1200.0,
+                        "oracle_avg_elapsed_us": 1200.0,
+                        "oracle_avg_logical_reads": 90.0,
+                        "source_ob_queue_time_us": 30.0,
+                        "source_ob_get_plan_time_us": 20.0,
+                        "source_ob_execute_time_us": 1150.0,
+                        "source_ob_net_time_us": 800.0,
+                        "source_ob_plan_type_raw": "3",
+                        "source_ob_is_hit_plan": "1",
+                        "source_ob_is_executor_rpc": "1",
+                        "source_sql_text_source": "captured",
+                    },
+                    {
+                        "sql_id": "sql-2",
+                        "sql_text": "SELECT * FROM invoices",
+                        "sql_text_normalized": "SELECT * FROM INVOICES",
+                        "baseline_avg_elapsed_us": 1000.0,
+                        "oracle_avg_elapsed_us": 1000.0,
+                        "oracle_avg_logical_reads": 40.0,
+                        "source_ob_queue_time_us": 20.0,
+                        "source_ob_get_plan_time_us": 10.0,
+                        "source_ob_execute_time_us": 900.0,
+                        "source_ob_net_time_us": 100.0,
+                        "source_ob_plan_type_raw": "1",
+                        "source_ob_is_hit_plan": "1",
+                        "source_ob_is_executor_rpc": "0",
+                        "source_sql_text_source": "ocp_native",
+                    },
+                ],
+            )
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.1",
+                    "port": "2881",
+                    "user_string": "root@test#obcluster",
+                    "password": "secret",
+                },
+                oceanbase_target={},
+                settings={
+                    "source_db_mode": "oceanbase",
+                    "source_schemas": ["APP"],
+                    "workloads_dir": tmpdir,
+                    "report_dir": str(report_dir),
+                    "top_n": 50,
+                    "slowdown_threshold": 0.8,
+                },
+                config_path="config.ini",
+            )
+
+            report_paths = perf_comparator.generate_report_from_source_workload(
+                config, workload_path, "20260422_200200"
+            )
+
+            summary_text = Path(report_paths["summary"]).read_text(encoding="utf-8")
+            html_text = Path(report_paths["html"]).read_text(encoding="utf-8")
+            hints_text = Path(report_paths["hints"]).read_text(encoding="utf-8")
+            self.assertIn("SQL text recovery detail: local=0 ocp_native=1 ocp_template=0", summary_text)
+            self.assertIn("sql: [captured]", summary_text)
+            self.assertIn("sql: [ocp_native]", summary_text)
+            self.assertIn('id="sql-source-chart"', html_text)
+            self.assertIn("ocp_native", html_text)
+            self.assertIn("-- sql_text_recovery_detail: local=0 ocp_native=1 ocp_template=0", hints_text)
 
 
 class PerfComparatorDocumentationTests(unittest.TestCase):

@@ -155,6 +155,11 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
   程序会通过 `/api/v2/ob/clusters` 自动解析
 - 如果当前 OCP 只能通过 `curl -k` 访问，就把 `ocp_verify_tls = false`
 - OCP 集成优先走 native `api/v2` SQL endpoints，特殊环境仍可回退到 URL template 模式
+- native OCP 已接入：
+  - `topSql`
+  - `slowSql`
+  - `sql/{sqlId}/text`
+  - `sqls/{sqlId}/trends`
 - obdiag 是可选能力，失败只会记到报告，不会阻塞主流程
 
 ## Source-Only SQL 获取协同
@@ -167,6 +172,7 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 4. 使用模板式 OCP fallback
 
 报告里会标出每条 SQL 最终来自哪条链路。
+source-only HTML 里还会给出 SQL 来源分布图，帮助你判断当前环境究竟多依赖 OCP 还是本地视图回填。
 
 ## 产物
 

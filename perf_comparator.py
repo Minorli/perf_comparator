@@ -985,6 +985,19 @@ def lookup_sql_texts_via_ocp_template(config, sql_ids):
     return resolved
 
 
+def compute_sql_text_source_distribution(rows):
+    # type: (Sequence[Dict[str, Any]]) -> Dict[str, int]
+    counts = {}  # type: Dict[str, int]
+    for row in rows:
+        source = str(
+            row.get("source_sql_text_source")
+            or row.get("source_sql_text_status")
+            or ("missing" if is_missing_sql_text(row.get("sql_text")) else "captured")
+        ).strip() or "unknown"
+        counts[source] = counts.get(source, 0) + 1
+    return counts
+
+
 def backfill_source_workload_sql_texts(config, workload_rows):
     # type: (AppConfig, List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
     lookup_cfg = get_source_sql_lookup_ob_cfg(config)
@@ -1050,7 +1063,9 @@ def backfill_source_workload_sql_texts(config, workload_rows):
                 updated.get("sql_text_normalized") or normalize_sql_text(sql_text)
             )
             updated["source_sql_text_status"] = "captured"
-            updated["source_sql_text_source"] = "captured"
+            updated["source_sql_text_source"] = (
+                str(updated.get("source_sql_text_source") or "").strip() or "captured"
+            )
             stats["captured"] += 1
         enriched_rows.append(updated)
     return enriched_rows, stats
@@ -2068,8 +2083,20 @@ def _collect_ocp_native_row_diagnostics(config, row, run_id):
             candidate_source = provider_name
     if candidate is None:
         manifest_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "ocp_native", ".json")
-        write_json(manifest_path, payload_manifest)
-        return {"status": "no-match", "summary": "; ".join(summaries), "artifact_path": str(manifest_path)}
+        write_json(
+            manifest_path,
+            {
+                "provider": "native_ocp",
+                "resolved_target": resolved_ids,
+                "payloads": payload_manifest,
+            },
+        )
+        return {
+            "status": "no-match",
+            "summary": "cluster=%s tenant=%s %s"
+            % (resolved_ids.get("cluster_id"), resolved_ids.get("tenant_id"), "; ".join(summaries)),
+            "artifact_path": str(manifest_path),
+        }
     ocp_sql_id = _first_non_empty(candidate, ("sqlId", "sql_id", "id"))
     if ocp_sql_id:
         text_url = _build_ocp_native_sql_text_url(config, str(ocp_sql_id))
@@ -2082,18 +2109,49 @@ def _collect_ocp_native_row_diagnostics(config, row, run_id):
         text_artifact_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "sql_text", ".json")
         write_text(text_artifact_path, body)
         payload_manifest["sql_text"] = {"url": text_url, "artifact_path": str(text_artifact_path)}
+        trends_url = "%s/api/v2/ob/clusters/%s/tenants/%s/sqls/%s/trends?startTime=%s&endTime=%s"
+        replayed_at = _parse_iso_datetime(row.get("replayed_at") or row.get("captured_at")) or datetime.now(timezone.utc)
+        if replayed_at.tzinfo is None:
+            replayed_at = replayed_at.replace(tzinfo=timezone.utc)
+        window_minutes = max(1, min(1440, int(config.settings.get("ocp_window_minutes", 15))))
+        trend_start = (replayed_at - timedelta(minutes=window_minutes)).isoformat()
+        trend_end = replayed_at.isoformat()
+        trends_url = trends_url % (
+            _build_ocp_native_base(config),
+            resolved_ids.get("cluster_id"),
+            resolved_ids.get("tenant_id"),
+            urllib.parse.quote(str(ocp_sql_id or ""), safe=""),
+            urllib.parse.quote(trend_start, safe=":"),
+            urllib.parse.quote(trend_end, safe=":"),
+        )
+        trends_request = urllib.request.Request(trends_url, headers=headers)
+        try:
+            trends_response = _open_ocp_request(config, trends_request, timeout_seconds)
+            trends_body = trends_response.read().decode("utf-8", errors="ignore")
+            trends_artifact_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "sql_trends", ".json")
+            write_text(trends_artifact_path, trends_body)
+            payload_manifest["sql_trends"] = {"url": trends_url, "artifact_path": str(trends_artifact_path)}
+        except Exception as exc:
+            payload_manifest["sql_trends"] = {"url": trends_url, "error": str(exc)}
     manifest_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "ocp_native", ".json")
     write_json(
         manifest_path,
         {
             "provider": "native_ocp",
+            "resolved_target": resolved_ids,
             "selected_source": candidate_source,
             "selected_sql_id": ocp_sql_id,
             "selected_candidate": candidate,
             "payloads": payload_manifest,
         },
     )
-    summary = "%s sqlId=%s hits=%s" % (candidate_source or "top_sql", ocp_sql_id or "n/a", "; ".join(summaries))
+    summary = "cluster=%s tenant=%s %s sqlId=%s hits=%s" % (
+        resolved_ids.get("cluster_id"),
+        resolved_ids.get("tenant_id"),
+        candidate_source or "top_sql",
+        ocp_sql_id or "n/a",
+        "; ".join(summaries),
+    )
     return {"status": "ok", "summary": summary, "artifact_path": str(manifest_path)}
 
 
@@ -4558,6 +4616,37 @@ def _render_svg_timing_chart(rows, chart_id, source_only=False):
     ).format(chart_id=chart_id, width=chart_width, height=chart_height, content="".join(fragments))
 
 
+def _render_svg_sql_source_chart(source_counts, chart_id):
+    # type: (Dict[str, int], str) -> str
+    if not source_counts:
+        return ""
+    ordered_items = sorted(source_counts.items(), key=lambda item: (-int(item[1]), item[0]))
+    chart_width = 440
+    chart_height = 56 + len(ordered_items) * 28
+    max_value = max(1, max(int(count) for _, count in ordered_items))
+    fragments = []
+    for idx, (label, count) in enumerate(ordered_items):
+        y = 30 + idx * 28
+        bar_width = (float(count) / float(max_value)) * 220.0
+        fragments.append(
+            '<text x="8" y="{y}" font-size="11">{label}</text>'
+            '<rect x="140" y="{y1}" width="{bw:.1f}" height="12" fill="#2b6cb0"></rect>'
+            '<text x="{tx:.1f}" y="{ty}" font-size="10">{count}</text>'.format(
+                y=y,
+                label=html.escape(label),
+                y1=y - 10,
+                bw=bar_width,
+                tx=146 + bar_width,
+                ty=y,
+                count=count,
+            )
+        )
+    return (
+        '<div id="{chart_id}" class="chart-block"><h3>SQL Text Source Distribution</h3>'
+        '<svg viewBox="0 0 {width} {height}" role="img" aria-label="sql source chart">{content}</svg></div>'
+    ).format(chart_id=chart_id, width=chart_width, height=chart_height, content="".join(fragments))
+
+
 def generate_report_from_replay(config, replay_path, run_id, workload_path=None):
     # type: (AppConfig, Union[str, Path], str, Optional[Union[str, Path]]) -> Dict[str, Path]
     replay_rows = read_jsonl(replay_path)
@@ -4748,6 +4837,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         1 for row in enriched_rows if not is_missing_sql_text(row.get("sql_text"))
     )
     missing_sql_stmt_count = max(0, len(enriched_rows) - visible_sql_stmt_count)
+    sql_source_counts = compute_sql_text_source_distribution(enriched_rows)
     slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
     for row in enriched_rows:
         if should_collect_plan_monitor(row, slowdown_threshold):
@@ -4804,9 +4894,9 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         ),
         "SQL text recovery detail: local=%d ocp_native=%d ocp_template=%d"
         % (
-            int(sql_text_stats.get("backfilled_via_local", 0)),
-            int(sql_text_stats.get("backfilled_via_ocp_native", 0)),
-            int(sql_text_stats.get("backfilled_via_ocp_template", 0)),
+            int(sql_source_counts.get("source_sys", 0)),
+            int(sql_source_counts.get("ocp_native", 0)),
+            int(sql_source_counts.get("ocp_template", 0)),
         ),
         "",
         "Top hotspots:",
@@ -4875,6 +4965,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
             )
         )
     charts_html = _render_svg_distribution_chart(enriched_rows, "source-distribution-chart")
+    charts_html += _render_svg_sql_source_chart(sql_source_counts, "sql-source-chart")
     charts_html += _render_svg_timing_chart(selected_rows, "source-timing-chart", source_only=True)
     html_content = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>perf_comparator source report</title>
@@ -4911,9 +5002,9 @@ pre { white-space: pre-wrap; margin: 0; }
     hints_lines.append(
         "-- sql_text_recovery_detail: local=%s ocp_native=%s ocp_template=%s"
         % (
-            int(sql_text_stats.get("backfilled_via_local", 0)),
-            int(sql_text_stats.get("backfilled_via_ocp_native", 0)),
-            int(sql_text_stats.get("backfilled_via_ocp_template", 0)),
+            int(sql_source_counts.get("source_sys", 0)),
+            int(sql_source_counts.get("ocp_native", 0)),
+            int(sql_source_counts.get("ocp_template", 0)),
         )
     )
     if missing_sql_stmt_count > 0:
