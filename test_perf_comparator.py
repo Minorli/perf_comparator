@@ -420,6 +420,14 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertIn("'ACTIVE'", rendered)
         self.assertIn("42", rendered)
 
+    def test_render_sql_for_replay_normalizes_call_statements(self):
+        rendered, skip_reason = perf_comparator.render_sql_for_replay(
+            "CALL test_profiler_pkg.run_profile_workload()",
+            {},
+        )
+        self.assertIsNone(skip_reason)
+        self.assertEqual(rendered, "BEGIN test_profiler_pkg.run_profile_workload(); END")
+
     def test_render_sql_for_replay_returns_skip_for_unsupported_bind_types(self):
         rendered, skip_reason = perf_comparator.render_sql_for_replay(
             "SELECT * FROM orders WHERE payload = :1",
@@ -725,6 +733,42 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertIn("tight_cpu_loop", diagnosis_ids)
         self.assertIn("ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop", analysis["diagnosis_summary"])
 
+    def test_analyze_plsql_profile_evidence_ignores_insignificant_noise_blocks(self):
+        hot_lines = [
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "line": 50,
+                "total_occur": 1000,
+                "total_time_us": 5000000.0,
+                "source_text": "EXECUTE IMMEDIATE v_stmt USING rec.id;",
+                "context_lines": [
+                    {"line": 49, "text": "FOR rec IN c_orders LOOP"},
+                    {"line": 50, "text": "  EXECUTE IMMEDIATE v_stmt USING rec.id;"},
+                    {"line": 51, "text": "END LOOP;"},
+                ],
+            },
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "line": 8,
+                "total_occur": 1,
+                "total_time_us": 10.0,
+                "source_text": "IF v_seed_count < 400 THEN",
+                "context_lines": [
+                    {"line": 8, "text": "IF v_seed_count < 400 THEN"},
+                    {"line": 9, "text": "  DELETE FROM t_case;"},
+                    {"line": 10, "text": "  FOR i IN 1..400 LOOP"},
+                ],
+            },
+        ]
+        analysis = perf_comparator.analyze_plsql_profile_evidence(hot_lines, [])
+        diagnosis_summaries = [item["line_range"] for item in analysis["diagnoses"]]
+        self.assertIn("50", diagnosis_summaries)
+        self.assertNotIn("8", diagnosis_summaries)
+
     def test_build_recommendations_emits_diagnosis_aware_plsql_rules(self):
         row = {
             "sql_id": "pkg-diag-1",
@@ -784,6 +828,17 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertIn("PLSQL-COMMIT-HOT", recommendation_map)
         self.assertIn("dynamic SQL", recommendation_map["PLSQL-DYNAMIC-SQL"]["message"])
         self.assertIn("COMMIT", recommendation_map["PLSQL-COMMIT-HOT"]["hint_sql"].upper())
+
+    def test_build_plsql_profiler_payload_uses_begin_end_wrappers(self):
+        payload = perf_comparator._build_plsql_profiler_payload(
+            "CALL TEST_PROFILER_PKG.run_profile_workload()",
+            "pc_case_1",
+        )
+        self.assertTrue(payload.startswith("BEGIN\n"))
+        self.assertIn("DBMS_PROFILER.START_PROFILER('pc_case_1');", payload)
+        self.assertIn("CALL TEST_PROFILER_PKG.run_profile_workload();", payload)
+        self.assertIn("DBMS_PROFILER.STOP_PROFILER();", payload)
+        self.assertTrue(payload.rstrip().endswith("END;"))
 
 
 class PerfComparatorOracleCaptureTests(unittest.TestCase):
@@ -1709,6 +1764,56 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
             sql for sql in executed_sql if "DBMS_PROFILER.OB_INIT_OBJECTS(FALSE)" in sql
         ]
         self.assertEqual(len(init_calls), 1)
+
+    def test_collect_plsql_profile_retries_with_single_block_payload(self):
+        config = self._build_config(plsql_profile=True)
+        config.settings["_current_run_id"] = "20260422_200002"
+        workload_row = {
+            "sql_id": "pkg-1",
+            "sql_text": "CALL TEST_PROFILER_PKG.run_profile_workload()",
+        }
+
+        responses = [
+            (True, "", ""),
+            (
+                False,
+                "",
+                "ORA-00900: You have an error in your SQL syntax; check the manual that corresponds to your OceanBase version for the right syntax to use near 'BEGIN' at line 2",
+            ),
+            (True, "", ""),
+            (True, "44\n", ""),
+            (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t18\t10\t900000\tFOR i IN 1..500000 LOOP\n", ""),
+            (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t900000\t10\n", ""),
+        ]
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            side_effect=responses,
+        ) as obclient_mock, mock.patch.object(
+            perf_comparator,
+            "_load_plsql_source_lines",
+            return_value={
+                "lines": {18: "FOR i IN 1..500000 LOOP"},
+                "source_view": "DBA_SOURCE",
+                "source_layout": "line_rows",
+                "source_mapping_strategy": "dba_source_line_rows",
+                "source_mapping_confidence": "high",
+                "ob_version": "4.2.5.7",
+            },
+        ), mock.patch.object(
+            perf_comparator,
+            "_fetch_plsql_source_context",
+            return_value=[],
+        ):
+            result = perf_comparator.collect_plsql_profile(
+                config, workload_row, "CALL TEST_PROFILER_PKG.run_profile_workload()", 30
+            )
+
+        self.assertEqual(result["status"], "ok")
+        executed_sql = [call.args[1] for call in obclient_mock.call_args_list]
+        self.assertEqual(len([sql for sql in executed_sql if "START_PROFILER" in sql]), 2)
+        self.assertTrue(any("TEST_PROFILER_PKG.run_profile_workload" in sql and "STOP_PROFILER" in sql for sql in executed_sql))
 
     def test_get_oceanbase_version_caches_probe_result(self):
         config = self._build_config(plsql_profile=True)

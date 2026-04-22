@@ -1932,6 +1932,11 @@ def _diagnose_profiler_block(block):
     return diagnoses
 
 
+def _is_significant_profiler_block(block):
+    # type: (Dict[str, Any]) -> bool
+    return float(block.get("profile_time_ratio") or 0.0) >= 0.001
+
+
 def analyze_plsql_profile_evidence(top_lines, unit_summary):
     # type: (List[Dict[str, Any]], List[Dict[str, Any]]) -> Dict[str, Any]
     normalized_units = [dict(item) for item in (unit_summary or [])]
@@ -1994,7 +1999,7 @@ def analyze_plsql_profile_evidence(top_lines, unit_summary):
             block.get("start_line") or 0,
             block.get("end_line") or 0,
         )
-        diagnoses = _diagnose_profiler_block(block)
+        diagnoses = _diagnose_profiler_block(block) if _is_significant_profiler_block(block) else []
         block["diagnosis_ids"] = [item["diagnosis_id"] for item in diagnoses]
         block["primary_diagnosis_id"] = diagnoses[0]["diagnosis_id"] if diagnoses else ""
         block["diagnosis_summary"] = (
@@ -2019,7 +2024,7 @@ def analyze_plsql_profile_evidence(top_lines, unit_summary):
     )
     diagnoses = []
     for block in hot_blocks:
-        block_diagnoses = _diagnose_profiler_block(block)
+        block_diagnoses = _diagnose_profiler_block(block) if _is_significant_profiler_block(block) else []
         diagnoses.extend(block_diagnoses)
     diagnoses = sorted(
         diagnoses,
@@ -2538,7 +2543,12 @@ def render_sql_for_replay(sql_text, bind_vars):
     _, skip_reason = literalize_bind_vars(bind_vars)
     if skip_reason:
         return None, skip_reason
-    return apply_bind_literals(sql_text, bind_vars), None
+    rendered = apply_bind_literals(sql_text, bind_vars)
+    normalized = str(rendered or "").strip()
+    call_match = re.match(r"^CALL\s+(.+?)\s*;?\s*$", normalized, flags=re.I | re.S)
+    if call_match:
+        normalized = "BEGIN %s; END" % call_match.group(1).rstrip(";").strip()
+    return normalized, None
 
 
 def derive_replay_metrics(row):
@@ -4620,7 +4630,7 @@ def ensure_plsql_profiler_initialized(config):
     cached = config.settings.get("_plsql_profiler_init_status")
     if isinstance(cached, dict):
         return bool(cached.get("ok")), str(cached.get("reason") or "")
-    init_sql = "CALL DBMS_PROFILER.OB_INIT_OBJECTS(FALSE);"
+    init_sql = "BEGIN DBMS_PROFILER.OB_INIT_OBJECTS(FALSE); END;"
     ok, stdout, stderr = obclient_run_sql(
         config.oceanbase_target,
         init_sql,
@@ -4640,11 +4650,37 @@ def ensure_plsql_profiler_initialized(config):
 
 def _build_plsql_profiler_payload(rendered_sql, profiler_comment):
     # type: (str, str) -> str
+    statement_sql = str(rendered_sql or "").strip().rstrip(";") + ";"
+    indented_statement = "\n".join("  " + line for line in statement_sql.splitlines())
     return "\n".join(
         [
-            "CALL DBMS_PROFILER.START_PROFILER('%s');" % _escape_sql_string(profiler_comment),
-            str(rendered_sql or "").rstrip().rstrip(";") + ";",
-            "CALL DBMS_PROFILER.STOP_PROFILER();",
+            "BEGIN",
+            "  DBMS_PROFILER.START_PROFILER('%s');" % _escape_sql_string(profiler_comment),
+            indented_statement,
+            "  DBMS_PROFILER.STOP_PROFILER();",
+            "END;",
+        ]
+    )
+
+
+def _should_retry_profiler_sequentially(error_text):
+    # type: (Any) -> bool
+    normalized = str(error_text or "").upper()
+    return "ORA-00900" in normalized and ("NEAR 'BEGIN'" in normalized or "NEAR 'CALL'" in normalized)
+
+
+def _build_plsql_profiler_single_block_payload(rendered_sql, profiler_comment):
+    # type: (str, str) -> str
+    normalized_sql = render_sql_for_replay(rendered_sql, {})[0] or str(rendered_sql or "").strip()
+    statement_sql = str(normalized_sql or "").strip().rstrip(";") + ";"
+    indented_statement = "\n".join("  " + line for line in statement_sql.splitlines())
+    return "\n".join(
+        [
+            "BEGIN",
+            "  DBMS_PROFILER.START_PROFILER('%s');" % _escape_sql_string(profiler_comment),
+            indented_statement,
+            "  DBMS_PROFILER.STOP_PROFILER();",
+            "END;",
         ]
     )
 
@@ -4841,6 +4877,15 @@ def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
             "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
         ),
     )
+    if not ok and _should_retry_profiler_sequentially(stderr or stdout):
+        ok, stdout, stderr = obclient_run_sql(
+            config.oceanbase_target,
+            _build_plsql_profiler_single_block_payload(rendered_sql, profiler_comment),
+            timeout=timeout_seconds,
+            session_query_timeout_us=config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
     if not ok:
         return {
             "status": "error",
