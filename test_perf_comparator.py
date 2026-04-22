@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import os
 import stat
 import tempfile
@@ -143,6 +144,40 @@ class PerfComparatorConfigTests(unittest.TestCase):
             self.assertEqual(cfg.settings["source_db_mode"], "oceanbase")
             self.assertEqual(cfg.oceanbase_source["host"], "127.0.0.2")
             self.assertEqual(cfg.oceanbase_source["user_string"], "app@test#obcluster")
+
+    def test_load_config_allows_missing_oracle_in_oceanbase_source_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = app@test#obcluster
+                    password = source_secret
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = target_secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(str(config_path))
+
+            self.assertEqual(cfg.settings["source_db_mode"], "oceanbase")
+            self.assertEqual(cfg.oracle_source, {})
 
 
 class PerfComparatorUtilityTests(unittest.TestCase):
@@ -309,6 +344,22 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["reason"], "too_large")
 
+    def test_build_plan_diff_signals_detects_lookup_risk(self):
+        row = {
+            "oracle_plan_rows": [
+                {"id": 1, "operation": "TABLE ACCESS", "options": "BY INDEX ROWID", "object_name": "ORDERS"},
+                {"id": 2, "operation": "INDEX", "options": "RANGE SCAN", "object_name": "IDX_ORDERS_STATUS"},
+            ],
+            "ob_plan_rows": [
+                {"id": 1, "operator": "TABLE LOOKUP", "name": "ORDERS"},
+                {"id": 2, "operator": "TABLE SCAN", "name": "ORDERS"},
+            ],
+            "ob_plan_type_raw": "3",
+            "plan_monitor_rows": [],
+        }
+        signals = perf_comparator.build_plan_diff_signals(row)
+        self.assertTrue(any(item["signal_id"] == "LOOKUP-RISK" for item in signals))
+
     def test_build_recommendations_handles_plan_miss_lock_hot_and_plsql(self):
         row = {
             "sql_text": "BEGIN pkg.run(); END",
@@ -416,7 +467,7 @@ class PerfComparatorObclientTests(unittest.TestCase):
 
 
 class PerfComparatorReplayEvidenceTests(unittest.TestCase):
-    def _build_config(self, verify_results=False):
+    def _build_config(self, verify_results=False, plsql_profile=False):
         return perf_comparator.AppConfig(
             oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
             oceanbase_source={},
@@ -431,6 +482,9 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
                 "source_schemas": ["APP"],
                 "verify_results": verify_results,
                 "result_sample_limit": 100,
+                "plsql_profile": plsql_profile,
+                "plsql_profile_top_n": 10,
+                "plsql_profile_source_context": 1,
                 "slowdown_threshold": 0.8,
                 "obclient_timeout": 5,
                 "ob_session_query_timeout_us": 0,
@@ -536,6 +590,112 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
         monitor_mock.assert_not_called()
         self.assertEqual(replay_row.get("plan_monitor_rows"), [])
         self.assertNotIn("verification_status", replay_row)
+
+    def test_replay_statement_attaches_plsql_profile_evidence(self):
+        config = self._build_config(plsql_profile=True)
+        workload_row = {
+            "sql_id": "pkg-1",
+            "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+            "baseline_avg_elapsed_us": 1000.0,
+            "oracle_avg_elapsed_us": 1000.0,
+            "oracle_avg_logical_reads": 20.0,
+        }
+        backend = mock.Mock()
+        backend.execute.return_value = (True, "ok", "")
+        backend.explain.return_value = (False, "", "explain not supported")
+
+        with mock.patch.object(
+            perf_comparator,
+            "_query_recent_audit_row",
+            return_value={
+                "ob_elapsed_us": 2200.0,
+                "ob_net_time_us": 1500.0,
+                "ob_plan_type_raw": "3",
+                "ob_is_hit_plan": "1",
+                "ob_is_executor_rpc": "1",
+                "ob_logical_reads": 40.0,
+                "trace_id": "trace-1",
+            },
+        ), mock.patch.object(
+            perf_comparator,
+            "collect_plsql_profile",
+            return_value={
+                "status": "ok",
+                "runid": 42,
+                "top_lines": [
+                    {
+                        "owner": "OMS_USER",
+                        "unit_name": "TEST_PROFILER_PKG",
+                        "unit_type": "PACKAGE BODY",
+                        "line": 18,
+                        "total_time_us": 900000.0,
+                        "source_text": "FOR i IN 1..500000 LOOP",
+                    }
+                ],
+                "artifact_path": "/tmp/plsql_profile.jsonl",
+            },
+        ) as profile_mock:
+            replay_row = perf_comparator.replay_statement(config, workload_row, backend=backend)
+
+        profile_mock.assert_called_once()
+        self.assertEqual(replay_row["plsql_profile_status"], "ok")
+        self.assertEqual(replay_row["plsql_profile_runid"], 42)
+        self.assertIn("TEST_PROFILER_PKG", replay_row["plsql_profile_summary"])
+
+
+class PerfComparatorRealDbValidationTests(unittest.TestCase):
+    def test_run_realdb_verification_writes_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = perf_comparator.AppConfig(
+                oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+                oceanbase_source={},
+                oceanbase_target={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.1",
+                    "port": "2881",
+                    "user_string": "root@test#obcluster",
+                    "password": "secret",
+                },
+                settings={
+                    "source_schemas": ["APP"],
+                    "workloads_dir": tmpdir,
+                    "report_dir": str(Path(tmpdir) / "reports"),
+                    "verify_results": True,
+                    "result_sample_limit": 10,
+                    "obclient_timeout": 5,
+                    "ob_session_query_timeout_us": 0,
+                },
+                config_path="config.ini",
+            )
+            args = argparse.Namespace(
+                sql_file=None,
+                realdb_oracle_config=None,
+                realdb_ob_source_config=None,
+                realdb_deploy_profile_package=False,
+                realdb_profile_package_sql=None,
+                realdb_profile_package_call=None,
+                realdb_cleanup_profile_package=False,
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "run_realdb_oracle_smoke",
+                return_value={"step": "oracle_replay_smoke", "status": "passed"},
+            ), mock.patch.object(
+                perf_comparator,
+                "run_realdb_ob_source_smoke",
+                return_value={"step": "ob_source_capture_smoke", "status": "skipped"},
+            ), mock.patch.object(
+                perf_comparator,
+                "run_realdb_profiler_smoke",
+                return_value={"step": "plsql_profiler_smoke", "status": "skipped"},
+            ):
+                summary_path = perf_comparator.run_realdb_verification(config, args, "20260422_170000")
+
+            summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "passed")
+            self.assertEqual(len(summary["steps"]), 3)
+            self.assertEqual(summary["steps"][0]["status"], "passed")
 
 
 class PerfComparatorCliTests(unittest.TestCase):
@@ -778,6 +938,74 @@ class PerfComparatorCliTests(unittest.TestCase):
             html_text = html_path.read_text(encoding="utf-8")
             self.assertIn("verification=mismatch", html_text)
             self.assertIn("monitor=HASH JOIN", html_text)
+
+    def test_report_only_mode_surfaces_plan_risk_and_plsql_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153000.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "pkg-1",
+                    "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+                    "baseline_avg_elapsed_us": 1000.0,
+                    "baseline_avg_logical_reads": 20.0,
+                    "oracle_plan_rows": [
+                        {"id": 1, "operation": "TABLE ACCESS", "options": "BY INDEX ROWID", "object_name": "ORDERS"}
+                    ],
+                },
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                {
+                    "sql_id": "pkg-1",
+                    "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+                    "ob_status": "ok",
+                    "ob_elapsed_us": 3000.0,
+                    "ob_net_time_us": 2100.0,
+                    "ob_plan_type_raw": "3",
+                    "ob_plan_rows": [{"id": 1, "operator": "TABLE LOOKUP", "name": "ORDERS"}],
+                    "plan_diff_signals": [
+                        {"signal_id": "LOOKUP-RISK", "severity": "high", "message": "lookup risk"}
+                    ],
+                    "plsql_profile_status": "ok",
+                    "plsql_profile_summary": "TEST_PROFILER_PKG:18:FOR i IN 1..500000 LOOP",
+                },
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+            self.assertEqual(exit_code, 0)
+            html_path = next(report_dir.glob("perf_report_*.html"))
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn("plan-risk=LOOKUP-RISK", html_text)
+            self.assertIn("plsql=TEST_PROFILER_PKG", html_text)
 
     def test_stream_mode_appends_only_new_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1059,6 +1287,52 @@ class PerfComparatorCliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(len(list(workloads_dir.glob("workload_*.jsonl"))), 1)
+
+    def test_verify_realdb_mode_generates_summary_artifact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            workloads_dir = Path(tmpdir) / "workloads"
+            report_dir = Path(tmpdir) / "reports"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=workloads_dir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "run_realdb_verification",
+                return_value=Path(tmpdir) / "workloads" / "realdb_verify_20260422_170000.json",
+            ) as verify_mock, mock.patch.object(
+                perf_comparator,
+                "validate_runtime_paths",
+                return_value=perf_comparator.PreflightResult(),
+            ):
+                exit_code = perf_comparator.main(
+                    ["--mode", "verify-realdb", "--config", str(config_path)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            verify_mock.assert_called_once()
 
 
 if __name__ == "__main__":

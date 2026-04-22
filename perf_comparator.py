@@ -34,6 +34,7 @@ MODE_STREAM = "stream"
 MODE_REPLAY_ONLY = "replay-only"
 MODE_REPORT_ONLY = "report-only"
 MODE_CHECK_CONFIG = "check-config"
+MODE_VERIFY_REALDB = "verify-realdb"
 
 DEFAULT_WORKLOADS_DIR = "workloads"
 DEFAULT_REPORT_DIR = "reports"
@@ -46,6 +47,8 @@ DEFAULT_INTERVAL = 60
 DEFAULT_AUDIT_POLL_MS = 300
 DEFAULT_OBCLIENT_TIMEOUT = 120
 DEFAULT_OB_SESSION_QUERY_TIMEOUT_US = 3600000000
+DEFAULT_PLSQL_PROFILE_TOP_N = 10
+DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT = 1
 
 SECTION_ORACLE_SOURCE = "ORACLE_SOURCE"
 SECTION_OCEANBASE_SOURCE = "OCEANBASE_SOURCE"
@@ -63,6 +66,7 @@ ARTIFACT_SPECS = {
     "replay_capability": ("replay_capability", ".json"),
     "plsql_profile": ("plsql_profile", ".jsonl"),
     "mismatch": ("mismatch", ".jsonl"),
+    "realdb_verify": ("realdb_verify", ".json"),
     "report_html": ("perf_report", ".html"),
     "report_summary": ("perf_report", "_summary.txt"),
     "report_hints": ("perf_hints", ".sql"),
@@ -78,6 +82,34 @@ PLAN_TYPE_NAMES = {
 LOG = logging.getLogger("perf_comparator")
 _SECURE_FILES = set()  # type: ignore[var-annotated]
 _SECURE_FILES_LOCK = threading.Lock()
+
+PROFILER_TEST_PACKAGE_NAME = "TEST_PROFILER_PKG"
+DEFAULT_REALDB_ORACLE_CONFIG = "/home/minorli/comparator/config.ini"
+DEFAULT_REALDB_OB_SOURCE_CONFIG = "/home/minorli/comparator/config.ini.ob"
+DEFAULT_REALDB_PROFILER_CALL = "CALL TEST_PROFILER_PKG.run_workload()"
+
+PROFILER_TEST_PACKAGE_SQL = """
+CREATE OR REPLACE PACKAGE TEST_PROFILER_PKG AS
+    PROCEDURE run_workload;
+END;
+/
+CREATE OR REPLACE PACKAGE BODY TEST_PROFILER_PKG AS
+    PROCEDURE burn_cpu IS
+        v_temp NUMBER := 0;
+    BEGIN
+        FOR i IN 1..50000 LOOP
+            v_temp := SQRT(i);
+        END LOOP;
+    END;
+
+    PROCEDURE run_workload IS
+    BEGIN
+        burn_cpu;
+        burn_cpu;
+    END;
+END;
+/
+"""
 
 
 class ConfigError(Exception):
@@ -370,17 +402,21 @@ def load_config(config_path):
     if not read_files:
         raise ConfigError("Unable to read config file: %s" % config_path)
 
-    oracle_section = _get_required_section(parser, SECTION_ORACLE_SOURCE)
     settings_section = _get_required_section(parser, SECTION_SETTINGS)
     source_db_mode = (settings_section.get("source_db_mode") or SOURCE_DB_MODE_ORACLE).strip().lower()
     if source_db_mode not in (SOURCE_DB_MODE_ORACLE, SOURCE_DB_MODE_OCEANBASE):
         raise ConfigError("[SETTINGS] source_db_mode must be oracle or oceanbase")
 
-    oracle_source = {
-        "user": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "user"),
-        "password": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "password"),
-        "dsn": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "dsn"),
-    }
+    oracle_source = {}
+    if parser.has_section(SECTION_ORACLE_SOURCE):
+        oracle_section = _get_required_section(parser, SECTION_ORACLE_SOURCE)
+        oracle_source = {
+            "user": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "user"),
+            "password": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "password"),
+            "dsn": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "dsn"),
+        }
+    elif source_db_mode != SOURCE_DB_MODE_OCEANBASE:
+        raise ConfigError("config.ini missing [%s] section" % SECTION_ORACLE_SOURCE)
     oceanbase_source = {}
     if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
         oceanbase_source = _load_ob_section(parser, SECTION_OCEANBASE_SOURCE)
@@ -409,6 +445,16 @@ def load_config(config_path):
         "verify_results": str(settings_section.get("verify_results") or "false").strip().lower()
         in ("1", "true", "yes", "on"),
         "result_sample_limit": _get_optional_int(settings_section, "result_sample_limit", 10000),
+        "plsql_profile": str(settings_section.get("plsql_profile") or "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+        "plsql_profile_top_n": _get_optional_int(
+            settings_section, "plsql_profile_top_n", DEFAULT_PLSQL_PROFILE_TOP_N
+        ),
+        "plsql_profile_source_context": _get_optional_int(
+            settings_section,
+            "plsql_profile_source_context",
+            DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT,
+        ),
         "obclient_timeout": _get_optional_int(
             settings_section, "obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT
         ),
@@ -893,6 +939,126 @@ def summarize_plan_monitor_evidence(row):
     return summary
 
 
+def is_plsql_statement(sql_text):
+    # type: (str) -> bool
+    normalized = normalize_sql_text(sql_text)
+    if normalized.startswith("BEGIN ") or normalized.startswith("DECLARE "):
+        return True
+    if normalized.startswith("CALL ") or normalized.startswith("EXEC ") or normalized.startswith("EXECUTE "):
+        return True
+    return False
+
+
+def _normalize_oracle_plan_operator(plan_row):
+    # type: (Dict[str, Any]) -> str
+    parts = [str(plan_row.get("operation") or "").strip(), str(plan_row.get("options") or "").strip()]
+    return " ".join(part for part in parts if part).strip().upper()
+
+
+def _normalize_ob_plan_operator(plan_row):
+    # type: (Dict[str, Any]) -> str
+    return str(plan_row.get("operator") or "").strip().upper()
+
+
+def build_plan_diff_signals(row):
+    # type: (Dict[str, Any]) -> List[Dict[str, str]]
+    oracle_ops = [_normalize_oracle_plan_operator(plan_row) for plan_row in (row.get("oracle_plan_rows") or [])]
+    ob_ops = [_normalize_ob_plan_operator(plan_row) for plan_row in (row.get("ob_plan_rows") or [])]
+    signals = []
+    ob_plan_type = str(row.get("ob_plan_type_raw") or row.get("ob_plan_type") or "").strip().upper()
+    if (
+        any("TABLE ACCESS BY INDEX ROWID" in op for op in oracle_ops)
+        and any("TABLE LOOKUP" in op for op in ob_ops)
+    ):
+        signals.append(
+            {
+                "signal_id": "LOOKUP-RISK",
+                "severity": "high",
+                "message": "Oracle indexed row access became OceanBase TABLE LOOKUP, which can add cross-node lookup cost.",
+            }
+        )
+    if (
+        any("NESTED LOOPS" in op for op in oracle_ops)
+        and any("JOIN (NL)" in op or "NESTED LOOP" in op for op in ob_ops)
+        and (ob_plan_type == "3" or ob_plan_type == "DISTRIBUTED")
+    ):
+        signals.append(
+            {
+                "signal_id": "NL-DIST-RISK",
+                "severity": "high",
+                "message": "Nested-loop style access is running under a distributed OceanBase plan and may amplify RPC cost.",
+            }
+        )
+    if (
+        any("PARTITION RANGE SINGLE" in op for op in oracle_ops)
+        and not any("PARTITION SCAN" in op for op in ob_ops)
+    ):
+        signals.append(
+            {
+                "signal_id": "PARTITION-PRUNE-MISS",
+                "severity": "medium",
+                "message": "Oracle single-partition access did not map cleanly to OceanBase partition scan semantics.",
+            }
+        )
+    monitor_rows = row.get("plan_monitor_rows") or []
+    if monitor_rows:
+        output_values = [float(monitor_row.get("output_rows") or 0.0) for monitor_row in monitor_rows]
+        positive_values = [value for value in output_values if value > 0.0]
+        if len(positive_values) > 1:
+            avg_output = sum(positive_values) / float(len(positive_values))
+            if avg_output > 0.0 and max(positive_values) > avg_output * 2.0:
+                signals.append(
+                    {
+                        "signal_id": "PX-SKEW",
+                        "severity": "high",
+                        "message": "Plan monitor shows operator output skew above 200% of the average worker output.",
+                    }
+                )
+        if any(float(monitor_row.get("workarea_tempseg") or 0.0) > 0.0 for monitor_row in monitor_rows):
+            signals.append(
+                {
+                    "signal_id": "SPILL-RISK",
+                    "severity": "high",
+                    "message": "Plan monitor shows workarea temp spill for at least one operator.",
+                }
+            )
+    return signals
+
+
+def summarize_plan_diff_signals(row):
+    # type: (Dict[str, Any]) -> str
+    signals = row.get("plan_diff_signals")
+    if signals is None:
+        signals = build_plan_diff_signals(row)
+    if not signals:
+        return "n/a"
+    return ",".join(str(signal.get("signal_id") or "") for signal in signals if signal.get("signal_id")) or "n/a"
+
+
+def summarize_plsql_profile(row):
+    # type: (Dict[str, Any]) -> str
+    if row.get("plsql_profile_summary"):
+        return str(row.get("plsql_profile_summary"))
+    if row.get("plsql_profile_status") != "ok":
+        if row.get("plsql_profile_status"):
+            return str(row.get("plsql_profile_status"))
+        return "n/a"
+    top_lines = row.get("plsql_profile_top_lines") or []
+    if not top_lines:
+        return "ok"
+    top_line = top_lines[0]
+    for candidate in top_lines:
+        source_text = str(candidate.get("source_text") or "").strip()
+        if source_text and source_text.upper() != "NULL":
+            top_line = candidate
+            break
+    return "%s:%s:%s" % (
+        top_line.get("unit_name") or "unit",
+        top_line.get("line") or "?",
+        str(top_line.get("source_text") or "").strip()[:80],
+    )
+
+
 def sql_literal(value):
     # type: (Any) -> str
     if value is None:
@@ -1129,6 +1295,31 @@ def build_recommendations(row, slowdown_threshold):
                 "hint_sql": "-- Investigate index usage, partition pruning, and row filtering predicates",
             }
         )
+    signal_ids = {str(signal.get("signal_id") or "") for signal in (row.get("plan_diff_signals") or [])}
+    if "LOOKUP-RISK" in signal_ids:
+        recommendations.append(
+            {
+                "rule_id": "PLAN-LOOKUP-RISK",
+                "message": "Plan translation shows TABLE LOOKUP risk after Oracle indexed row access.",
+                "hint_sql": "-- Prefer local indexes or co-located access paths to avoid remote table lookup amplification",
+            }
+        )
+    if "PX-SKEW" in signal_ids:
+        recommendations.append(
+            {
+                "rule_id": "PX-SKEW",
+                "message": "Operator output is skewed across workers, indicating parallel imbalance.",
+                "hint_sql": "-- Review partitioning and PQ_DISTRIBUTE strategy to reduce worker skew",
+            }
+        )
+    if row.get("plsql_profile_status") == "ok" and row.get("plsql_profile_top_lines"):
+        recommendations.append(
+            {
+                "rule_id": "PLSQL-HOTLINE",
+                "message": "Profiler captured a hot PL/SQL source line for this replay.",
+                "hint_sql": "-- Review the reported package line and replace row-by-row loops with set-based or FORALL logic",
+            }
+        )
     if row.get("verification_status") == "mismatch":
         recommendations.append(
             {
@@ -1274,10 +1465,11 @@ def validate_runtime_paths(config):
     # type: (AppConfig) -> PreflightResult
     result = PreflightResult()
 
-    try:
-        parse_oracle_dsn(config.oracle_source.get("dsn", ""))
-    except ConfigError as exc:
-        result.errors.append(str(exc))
+    if config.oracle_source:
+        try:
+            parse_oracle_dsn(config.oracle_source.get("dsn", ""))
+        except ConfigError as exc:
+            result.errors.append(str(exc))
 
     obclient_path = Path(config.oceanbase_target.get("executable", "")).expanduser()
     if not obclient_path.exists():
@@ -1298,7 +1490,7 @@ def validate_runtime_paths(config):
                 "source obclient executable exists but is not executable: %s" % str(source_ob_path)
             )
 
-    if oracledb is None:
+    if oracledb is None and config.oracle_source:
         result.warnings.append(
             "python-oracledb is not installed in the current environment; Oracle capture will not run"
         )
@@ -1308,15 +1500,8 @@ def validate_runtime_paths(config):
 
 def summarize_config(config):
     # type: (AppConfig) -> Dict[str, Any]
-    host, port, service_name = parse_oracle_dsn(config.oracle_source["dsn"])
     summary = {
         "config_path": config.config_path,
-        "oracle_source": {
-            "user": config.oracle_source["user"],
-            "host": host,
-            "port": port,
-            "service_name": service_name,
-        },
         "oceanbase_target": {
             "executable": config.oceanbase_target["executable"],
             "host": config.oceanbase_target["host"],
@@ -1325,6 +1510,14 @@ def summarize_config(config):
         },
         "settings": config.settings,
     }
+    if config.oracle_source:
+        host, port, service_name = parse_oracle_dsn(config.oracle_source["dsn"])
+        summary["oracle_source"] = {
+            "user": config.oracle_source["user"],
+            "host": host,
+            "port": port,
+            "service_name": service_name,
+        }
     if config.oceanbase_source:
         summary["oceanbase_source"] = {
             "executable": config.oceanbase_source["executable"],
@@ -1347,13 +1540,14 @@ def probe_oracle_capabilities(config):
     # type: (AppConfig) -> Dict[str, Any]
     capabilities = {
         "oracle_driver_available": bool(oracledb is not None),
+        "configured": bool(config.oracle_source),
         "awr": False,
         "vsql": False,
         "unified_audit": False,
         "wcr": False,
         "sql_file": True,
     }
-    if oracledb is None:
+    if oracledb is None or not config.oracle_source:
         return capabilities
     try:
         connection = oracledb.connect(
@@ -1429,14 +1623,18 @@ def probe_replay_capabilities(config):
 def write_capability_files(config, run_id, capture_capabilities=None, replay_capabilities=None):
     # type: (AppConfig, str) -> None
     workloads_dir = config.settings["workloads_dir"]
+    default_capture_capabilities = {
+        "run_id": run_id,
+        "oracle_driver_available": bool(oracledb is not None),
+    }
+    if config.oracle_source:
+        default_capture_capabilities["oracle_dsn"] = config.oracle_source["dsn"]
+    elif config.oceanbase_source:
+        default_capture_capabilities["source_mode"] = SOURCE_DB_MODE_OCEANBASE
+        default_capture_capabilities["source_obclient_host"] = config.oceanbase_source.get("host")
     write_json(
         build_artifact_path("capture_capability", run_id, root_dir=workloads_dir),
-        capture_capabilities
-        or {
-            "run_id": run_id,
-            "oracle_driver_available": bool(oracledb is not None),
-            "oracle_dsn": config.oracle_source["dsn"],
-        },
+        capture_capabilities or default_capture_capabilities,
     )
     write_json(
         build_artifact_path("replay_capability", run_id, root_dir=workloads_dir),
@@ -1491,6 +1689,8 @@ def _open_oracle_connection(config):
     # type: (AppConfig) -> Any
     if oracledb is None:
         raise ConfigError("python-oracledb is not installed")
+    if not config.oracle_source:
+        raise ConfigError("Oracle source is not configured for this workflow")
     return oracledb.connect(
         user=config.oracle_source["user"],
         password=config.oracle_source["password"],
@@ -1943,6 +2143,238 @@ def _safe_float(value):
         return None
 
 
+def _safe_int(value):
+    # type: (Any) -> Optional[int]
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _escape_sql_string(value):
+    # type: (str) -> str
+    return str(value or "").replace("'", "''")
+
+
+def _build_plsql_profiler_payload(rendered_sql, profiler_comment):
+    # type: (str, str) -> str
+    return "\n".join(
+        [
+            "CALL DBMS_PROFILER.START_PROFILER('%s');" % _escape_sql_string(profiler_comment),
+            str(rendered_sql or "").rstrip().rstrip(";") + ";",
+            "CALL DBMS_PROFILER.STOP_PROFILER();",
+        ]
+    )
+
+
+def _lookup_plsql_profile_runid(config, profiler_comment):
+    # type: (AppConfig, str) -> Optional[int]
+    query = """
+        SELECT * FROM (
+          SELECT RUNID
+          FROM PLSQL_PROFILER_RUNS
+          WHERE RUN_COMMENT = '{comment}'
+          ORDER BY RUNID DESC
+        ) WHERE ROWNUM = 1
+    """.format(comment=_escape_sql_string(profiler_comment))
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return None
+    first_line = stdout.splitlines()[0].split("\t")[0]
+    return _safe_int(first_line)
+
+
+def _fetch_plsql_source_context(config, owner, unit_name, unit_type, line_no, context_size):
+    # type: (AppConfig, str, str, str, int, int) -> List[Dict[str, Any]]
+    low_line = max(1, int(line_no) - max(0, int(context_size or 0)))
+    high_line = int(line_no) + max(0, int(context_size or 0))
+    query = """
+        SELECT LINE, TEXT
+        FROM ALL_SOURCE
+        WHERE OWNER = '{owner}'
+          AND NAME = '{unit_name}'
+          AND TYPE = '{unit_type}'
+          AND LINE BETWEEN {low_line} AND {high_line}
+        ORDER BY LINE
+    """.format(
+        owner=_escape_sql_string(owner),
+        unit_name=_escape_sql_string(unit_name),
+        unit_type=_escape_sql_string(unit_type),
+        low_line=low_line,
+        high_line=high_line,
+    )
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return []
+    context_rows = []
+    for raw_line in stdout.splitlines():
+        fields = raw_line.split("\t", 1)
+        if len(fields) < 2:
+            continue
+        line_value = _safe_int(fields[0])
+        if line_value is None:
+            continue
+        context_rows.append({"line": line_value, "text": fields[1]})
+    return context_rows
+
+
+def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
+    # type: (AppConfig, int, int, int) -> List[Dict[str, Any]]
+    query = """
+        SELECT * FROM (
+          SELECT
+            u.UNIT_OWNER,
+            u.UNIT_NAME,
+            u.UNIT_TYPE,
+            d.LINE#,
+            d.TOTAL_OCCUR,
+            d.TOTAL_TIME,
+            s.TEXT
+          FROM PLSQL_PROFILER_UNITS u
+          JOIN PLSQL_PROFILER_DATA d
+            ON d.RUNID = u.RUNID
+           AND d.UNIT_NUMBER = u.UNIT_NUMBER
+          LEFT JOIN ALL_SOURCE s
+            ON s.OWNER = u.UNIT_OWNER
+           AND s.NAME = u.UNIT_NAME
+           AND s.TYPE = u.UNIT_TYPE
+           AND s.LINE = d.LINE#
+          WHERE u.RUNID = {runid}
+          ORDER BY d.TOTAL_TIME DESC, d.LINE#
+        ) WHERE ROWNUM <= {top_n}
+    """.format(runid=int(runid), top_n=max(1, int(top_n or 1)))
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return []
+    hot_lines = []
+    for raw_line in stdout.splitlines():
+        fields = raw_line.split("\t")
+        if len(fields) < 7:
+            continue
+        line_no = _safe_int(fields[3])
+        if line_no is None:
+            continue
+        source_text = fields[6]
+        row = {
+            "owner": fields[0],
+            "unit_name": fields[1],
+            "unit_type": fields[2],
+            "line": line_no,
+            "total_occur": _safe_int(fields[4]),
+            "total_time_us": _safe_float(fields[5]),
+            "source_text": source_text,
+        }
+        if int(context_size or 0) > 0:
+            row["context_lines"] = _fetch_plsql_source_context(
+                config,
+                fields[0],
+                fields[1],
+                fields[2],
+                line_no,
+                int(context_size or 0),
+            )
+            if str(source_text or "").strip().upper() == "NULL" and row["context_lines"]:
+                matched_context = [
+                    context_row.get("text")
+                    for context_row in row["context_lines"]
+                    if int(context_row.get("line") or 0) == line_no and str(context_row.get("text") or "").strip()
+                ]
+                if matched_context:
+                    row["source_text"] = matched_context[0]
+                else:
+                    row["source_text"] = str(row["context_lines"][0].get("text") or "")
+        hot_lines.append(row)
+    return hot_lines
+
+
+def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
+    # type: (AppConfig, Dict[str, Any], str, int) -> Dict[str, Any]
+    run_group = str(config.settings.get("_current_run_id") or generate_run_id())
+    profiler_comment = "perf_comparator:%s:%s:%s" % (
+        run_group,
+        workload_row.get("sql_id") or compute_sql_id(rendered_sql),
+        int(time.time()),
+    )
+    ok, stdout, stderr = obclient_run_sql(
+        config.oceanbase_target,
+        _build_plsql_profiler_payload(rendered_sql, profiler_comment),
+        timeout=timeout_seconds,
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok:
+        return {
+            "status": "error",
+            "error": stderr or stdout,
+            "runid": None,
+            "top_lines": [],
+            "artifact_path": "",
+        }
+    runid = _lookup_plsql_profile_runid(config, profiler_comment)
+    if runid is None:
+        return {
+            "status": "skipped",
+            "error": "profiler_run_not_found",
+            "runid": None,
+            "top_lines": [],
+            "artifact_path": "",
+        }
+    top_lines = _fetch_plsql_profile_top_lines(
+        config,
+        runid,
+        int(config.settings.get("plsql_profile_top_n", DEFAULT_PLSQL_PROFILE_TOP_N)),
+        int(config.settings.get("plsql_profile_source_context", DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT)),
+    )
+    artifact_path = build_artifact_path(
+        "plsql_profile",
+        run_group,
+        root_dir=config.settings["workloads_dir"],
+    )
+    append_jsonl(
+        artifact_path,
+        {
+            "sql_id": workload_row.get("sql_id"),
+            "sql_text": workload_row.get("sql_text"),
+            "rendered_sql": rendered_sql,
+            "runid": runid,
+            "profiler_comment": profiler_comment,
+            "top_lines": top_lines,
+            "captured_at": utc_now_iso(),
+        },
+    )
+    return {
+        "status": "ok",
+        "error": "",
+        "runid": runid,
+        "top_lines": top_lines,
+        "artifact_path": str(artifact_path),
+    }
+
+
 def replay_statement(config, workload_row, audit_collector=None, backend=None):
     # type: (AppConfig, Dict[str, Any], Optional[SQLAuditCollector], Optional[ReplayBackend]) -> Dict[str, Any]
     backend = backend or ObclientReplayBackend()
@@ -2024,6 +2456,7 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
     merged = dict(workload_row)
     merged.update(replay_row)
     merged.update(derive_replay_metrics(merged))
+    merged["plan_diff_signals"] = build_plan_diff_signals(merged)
     if (
         ok
         and config.settings.get("verify_results")
@@ -2053,6 +2486,29 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
         except Exception:
             LOG.exception("Plan monitor collection failed for sql_id=%s", workload_row.get("sql_id"))
             merged["plan_monitor_rows"] = []
+        merged["plan_diff_signals"] = build_plan_diff_signals(merged)
+    if ok and config.settings.get("plsql_profile") and is_plsql_statement(rendered_sql):
+        try:
+            plsql_profile = collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds)
+        except Exception as exc:
+            plsql_profile = {
+                "status": "error",
+                "error": str(exc),
+                "runid": None,
+                "top_lines": [],
+                "artifact_path": "",
+            }
+        merged["plsql_profile_status"] = plsql_profile.get("status")
+        merged["plsql_profile_error"] = plsql_profile.get("error")
+        merged["plsql_profile_runid"] = plsql_profile.get("runid")
+        merged["plsql_profile_artifact_path"] = plsql_profile.get("artifact_path")
+        merged["plsql_profile_top_lines"] = plsql_profile.get("top_lines") or []
+        merged["plsql_profile_summary"] = summarize_plsql_profile(
+            {
+                "plsql_profile_status": plsql_profile.get("status"),
+                "plsql_profile_top_lines": plsql_profile.get("top_lines") or [],
+            }
+        )
     merged["recommendations"] = build_recommendations(
         merged, slowdown_threshold=slowdown_threshold
     )
@@ -2061,6 +2517,7 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
 
 def replay_workload(config, workload_path, run_id):
     # type: (AppConfig, Union[str, Path], str) -> Path
+    config.settings["_current_run_id"] = run_id
     replay_capabilities = probe_replay_capabilities(config)
     replay_capabilities["run_id"] = run_id
     capture_capabilities = probe_oracle_capabilities(config)
@@ -2109,6 +2566,9 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         base = dict(workload_index.get(str(replay_row.get("sql_id") or ""), {}))
         base.update(replay_row)
         base.update(derive_replay_metrics(base))
+        base["plan_diff_signals"] = replay_row.get("plan_diff_signals") or build_plan_diff_signals(base)
+        if "plsql_profile_summary" not in base:
+            base["plsql_profile_summary"] = summarize_plsql_profile(base)
         base["recommendations"] = build_recommendations(
             base,
             slowdown_threshold=float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD)),
@@ -2142,8 +2602,10 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
         verification_status = summarize_verification_evidence(row)
         plan_monitor_summary = summarize_plan_monitor_evidence(row)
+        plan_risk_summary = summarize_plan_diff_signals(row)
+        plsql_profile_summary = summarize_plsql_profile(row)
         summary_lines.append(
-            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s"
+            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s plan_risk=%s plsql=%s"
             % (
                 idx,
                 row.get("sql_id"),
@@ -2153,6 +2615,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 rule_ids,
                 verification_status,
                 plan_monitor_summary,
+                plan_risk_summary,
+                plsql_profile_summary,
             )
         )
     write_text(summary_path, "\n".join(summary_lines) + "\n")
@@ -2161,6 +2625,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
     for row in selected_rows:
         verification_status = summarize_verification_evidence(row)
         plan_monitor_summary = summarize_plan_monitor_evidence(row)
+        plan_risk_summary = summarize_plan_diff_signals(row)
+        plsql_profile_summary = summarize_plsql_profile(row)
         html_rows.append(
             "<tr><td>{sql_id}</td><td>{speedup}</td><td>{oracle}</td><td>{ob}</td><td>{rules}</td><td>{evidence}</td><td><pre>{sql}</pre></td></tr>".format(
                 sql_id=html.escape(str(row.get("sql_id"))),
@@ -2176,10 +2642,12 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                     )
                 ),
                 evidence=html.escape(
-                    "verification=%s | monitor=%s"
+                    "verification=%s | monitor=%s | plan-risk=%s | plsql=%s"
                     % (
                         verification_status,
                         plan_monitor_summary,
+                        plan_risk_summary,
+                        plsql_profile_summary,
                     )
                 ),
                 sql=html.escape(str(row.get("sql_text") or "")),
@@ -2213,12 +2681,344 @@ pre { white-space: pre-wrap; margin: 0; }
             hints_lines.append(
                 "-- plan-monitor: %s" % summarize_plan_monitor_evidence(row)
             )
+        if row.get("plan_diff_signals"):
+            hints_lines.append(
+                "-- plan-risk: %s" % summarize_plan_diff_signals(row)
+            )
+        if row.get("plsql_profile_status"):
+            hints_lines.append(
+                "-- plsql-profile: %s" % summarize_plsql_profile(row)
+            )
         for item in row.get("recommendations", []):
             hints_lines.append("-- %s: %s" % (item["rule_id"], item["message"]))
             hints_lines.append(item["hint_sql"])
         hints_lines.append("")
     write_text(hints_path, "\n".join(hints_lines).rstrip() + "\n")
     return {"summary": summary_path, "html": html_path, "hints": hints_path}
+
+
+def clone_app_config(
+    config,
+    oracle_source=None,
+    oceanbase_source=None,
+    oceanbase_target=None,
+    settings_updates=None,
+    config_path=None,
+):
+    # type: (AppConfig, Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, Any]], Optional[str]) -> AppConfig
+    settings = dict(config.settings)
+    if settings_updates:
+        settings.update(settings_updates)
+    return AppConfig(
+        oracle_source=dict(oracle_source if oracle_source is not None else config.oracle_source),
+        oceanbase_source=dict(oceanbase_source if oceanbase_source is not None else config.oceanbase_source),
+        oceanbase_target=dict(oceanbase_target if oceanbase_target is not None else config.oceanbase_target),
+        settings=settings,
+        config_path=str(config_path or config.config_path),
+    )
+
+
+def resolve_realdb_reference_path(explicit_path, default_path):
+    # type: (Optional[str], str) -> Optional[str]
+    candidate = str(explicit_path or "").strip()
+    if candidate:
+        if Path(candidate).exists():
+            return candidate
+        return None
+    if Path(default_path).exists():
+        return default_path
+    return None
+
+
+def load_runtime_reference_config(path):
+    # type: (str) -> Optional[AppConfig]
+    if not path:
+        return None
+    try:
+        return load_config(path)
+    except Exception:
+        LOG.exception("Failed to load runtime reference config: %s", path)
+        return None
+
+
+def resolve_realdb_oracle_config(config, args):
+    # type: (AppConfig, argparse.Namespace) -> AppConfig
+    if config.oracle_source:
+        return config
+    reference_path = resolve_realdb_reference_path(
+        getattr(args, "realdb_oracle_config", None), DEFAULT_REALDB_ORACLE_CONFIG
+    )
+    reference_config = load_runtime_reference_config(reference_path) if reference_path else None
+    if reference_config and reference_config.oracle_source:
+        return clone_app_config(
+            config,
+            oracle_source=reference_config.oracle_source,
+            config_path=reference_config.config_path,
+        )
+    return config
+
+
+def resolve_realdb_ob_source_config(config, args):
+    # type: (AppConfig, argparse.Namespace) -> AppConfig
+    if config.oceanbase_source:
+        return config
+    reference_path = str(getattr(args, "realdb_ob_source_config", None) or "").strip()
+    if not reference_path:
+        return config
+    reference_config = load_runtime_reference_config(reference_path) if reference_path else None
+    if reference_config and reference_config.oceanbase_source:
+        return clone_app_config(
+            config,
+            oceanbase_source=reference_config.oceanbase_source,
+            settings_updates={"source_db_mode": SOURCE_DB_MODE_OCEANBASE},
+            config_path=reference_config.config_path,
+        )
+    return config
+
+
+def probe_ob_source_audit_capability(config):
+    # type: (AppConfig) -> Tuple[bool, str]
+    if not config.oceanbase_source:
+        return False, "ob_source_not_configured"
+    ok, stdout, stderr = _obclient_run_sql_on_source(
+        config,
+        "SELECT REQUEST_ID FROM GV$OB_SQL_AUDIT WHERE ROWNUM = 1",
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if ok:
+        return True, ""
+    return False, (stderr or stdout or "source_sql_audit_unavailable")
+
+
+def _build_realdb_probe_sql():
+    # type: () -> str
+    return "SELECT 1 AS PERF_COMPARATOR_PROBE, 'PING' AS PERF_COMPARATOR_TAG FROM dual"
+
+
+def _split_ddl_blocks(sql_text):
+    # type: (str) -> List[str]
+    blocks = re.split(r"(?m)^\s*/\s*$", str(sql_text or ""))
+    return [block.strip() for block in blocks if block.strip()]
+
+
+def deploy_profile_test_package(config, package_sql=None):
+    # type: (AppConfig, Optional[str]) -> None
+    sql_text = package_sql or PROFILER_TEST_PACKAGE_SQL
+    for block in _split_ddl_blocks(sql_text):
+        ok, stdout, stderr = obclient_run_sql(
+            config.oceanbase_target,
+            block,
+            timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+            session_query_timeout_us=config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
+        if not ok:
+            raise ConfigError("Failed to deploy profiler test package: %s" % (stderr or stdout))
+
+
+def cleanup_profile_test_package(config):
+    # type: (AppConfig) -> None
+    obclient_run_sql(
+        config.oceanbase_target,
+        "DROP PACKAGE %s" % PROFILER_TEST_PACKAGE_NAME,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+
+
+def run_realdb_oracle_smoke(config, args, run_id):
+    # type: (AppConfig, argparse.Namespace, str) -> Dict[str, Any]
+    smoke_config = resolve_realdb_oracle_config(config, args)
+    if not smoke_config.oracle_source:
+        return {"step": "oracle_replay_smoke", "status": "skipped", "reason": "oracle_not_configured"}
+    connection = _open_oracle_connection(smoke_config)
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1 FROM dual")
+        cursor.fetchone()
+        cursor.close()
+    finally:
+        connection.close()
+    smoke_run_id = "%s_oracle" % run_id
+    smoke_sql_path = Path(smoke_config.settings["workloads_dir"]) / ("realdb_probe_%s.sql" % smoke_run_id)
+    write_text(smoke_sql_path, _build_realdb_probe_sql() + ";\n")
+    smoke_runtime_config = clone_app_config(
+        smoke_config,
+        settings_updates={
+            "verify_results": True,
+            "result_sample_limit": min(
+                int(smoke_config.settings.get("result_sample_limit", 10000) or 10000), 100
+            ),
+            "_current_run_id": smoke_run_id,
+        },
+    )
+    workload_path = capture_from_sql_file(smoke_runtime_config, str(smoke_sql_path), smoke_run_id)
+    replay_path = replay_workload(smoke_runtime_config, workload_path, smoke_run_id)
+    report_paths = generate_report_from_replay(smoke_runtime_config, replay_path, smoke_run_id, workload_path)
+    replay_rows = read_jsonl(replay_path)
+    verification_status = replay_rows[0].get("verification_status") if replay_rows else None
+    return {
+        "step": "oracle_replay_smoke",
+        "status": "passed",
+        "workload_path": str(workload_path),
+        "replay_path": str(replay_path),
+        "summary_path": str(report_paths["summary"]),
+        "verification_status": verification_status,
+    }
+
+
+def run_realdb_profiler_smoke(config, args, run_id):
+    # type: (AppConfig, argparse.Namespace, str) -> Dict[str, Any]
+    if not getattr(args, "realdb_deploy_profile_package", False):
+        return {"step": "plsql_profiler_smoke", "status": "skipped", "reason": "package_deploy_not_enabled"}
+    package_sql = None
+    if getattr(args, "realdb_profile_package_sql", None):
+        package_sql = Path(args.realdb_profile_package_sql).read_text(encoding="utf-8")
+    try:
+        deploy_profile_test_package(config, package_sql=package_sql)
+    except Exception as exc:
+        return {
+            "step": "plsql_profiler_smoke",
+            "status": "skipped",
+            "reason": "package_deploy_failed",
+            "error": str(exc),
+        }
+    try:
+        profile_call = (
+            getattr(args, "realdb_profile_package_call", None)
+            or DEFAULT_REALDB_PROFILER_CALL
+        )
+        profile_config = clone_app_config(
+            config,
+            settings_updates={
+                "plsql_profile": True,
+                "_current_run_id": "%s_profiler" % run_id,
+            },
+        )
+        replay_row = replay_statement(
+            profile_config,
+            {
+                "sql_id": "realdb_profiler_pkg",
+                "sql_text": profile_call,
+                "baseline_avg_elapsed_us": 5000000.0,
+                "oracle_avg_elapsed_us": 5000000.0,
+                "oracle_avg_logical_reads": 1.0,
+            },
+        )
+    finally:
+        if getattr(args, "realdb_cleanup_profile_package", False):
+            cleanup_profile_test_package(config)
+    if replay_row.get("ob_status") != "ok":
+        return {
+            "step": "plsql_profiler_smoke",
+            "status": "failed",
+            "ob_status": replay_row.get("ob_status"),
+            "ob_error_code": replay_row.get("ob_error_code"),
+            "plsql_profile_status": replay_row.get("plsql_profile_status"),
+            "plsql_profile_summary": replay_row.get("plsql_profile_summary"),
+            "plsql_profile_artifact_path": replay_row.get("plsql_profile_artifact_path"),
+            "error": replay_row.get("ob_error_code"),
+        }
+    status = "passed" if replay_row.get("plsql_profile_status") == "ok" else "skipped"
+    return {
+        "step": "plsql_profiler_smoke",
+        "status": status,
+        "ob_status": replay_row.get("ob_status"),
+        "ob_error_code": replay_row.get("ob_error_code"),
+        "plsql_profile_status": replay_row.get("plsql_profile_status"),
+        "plsql_profile_summary": replay_row.get("plsql_profile_summary"),
+        "plsql_profile_artifact_path": replay_row.get("plsql_profile_artifact_path"),
+        "error": replay_row.get("plsql_profile_error") or replay_row.get("ob_error_code"),
+    }
+
+
+def run_realdb_ob_source_smoke(config, args, run_id):
+    # type: (AppConfig, argparse.Namespace, str) -> Dict[str, Any]
+    smoke_config = resolve_realdb_ob_source_config(config, args)
+    if not smoke_config.oceanbase_source:
+        return {"step": "ob_source_capture_smoke", "status": "skipped", "reason": "ob_source_not_requested"}
+    audit_available, audit_reason = probe_ob_source_audit_capability(smoke_config)
+    if not audit_available:
+        return {
+            "step": "ob_source_capture_smoke",
+            "status": "skipped",
+            "reason": "source_sql_audit_unavailable",
+            "error": audit_reason,
+        }
+    source_probe_sql = _build_realdb_probe_sql()
+    for _ in range(2):
+        ok, stdout, stderr = _obclient_run_sql_on_source(
+            smoke_config,
+            source_probe_sql,
+            timeout=smoke_config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+            session_query_timeout_us=smoke_config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
+        if not ok:
+            return {
+                "step": "ob_source_capture_smoke",
+                "status": "failed",
+                "error": stderr or stdout,
+            }
+    smoke_run_id = "%s_obsource" % run_id
+    smoke_runtime_config = clone_app_config(
+        smoke_config,
+        settings_updates={
+            "duration": 1,
+            "interval": 1,
+            "_current_run_id": smoke_run_id,
+        },
+    )
+    workload_path = capture_workload_from_ob_source(
+        smoke_runtime_config, argparse.Namespace(duration=1), smoke_run_id
+    )
+    replay_path = replay_workload(smoke_runtime_config, workload_path, smoke_run_id)
+    report_paths = generate_report_from_replay(smoke_runtime_config, replay_path, smoke_run_id, workload_path)
+    return {
+        "step": "ob_source_capture_smoke",
+        "status": "passed",
+        "workload_path": str(workload_path),
+        "replay_path": str(replay_path),
+        "summary_path": str(report_paths["summary"]),
+    }
+
+
+def run_realdb_verification(config, args, run_id):
+    # type: (AppConfig, argparse.Namespace, str) -> Path
+    steps = []
+    for runner in (run_realdb_oracle_smoke, run_realdb_profiler_smoke, run_realdb_ob_source_smoke):
+        try:
+            steps.append(runner(config, args, run_id))
+        except Exception as exc:
+            LOG.exception("Real DB verification step failed")
+            step_name = getattr(runner, "__name__", "realdb_step")
+            steps.append({"step": step_name, "status": "failed", "error": str(exc)})
+    statuses = [step.get("status") for step in steps]
+    overall_status = "passed"
+    if any(status == "failed" for status in statuses):
+        overall_status = "failed"
+    elif all(status == "skipped" for status in statuses):
+        overall_status = "skipped"
+    summary = {
+        "run_id": run_id,
+        "status": overall_status,
+        "generated_at": utc_now_iso(),
+        "steps": steps,
+    }
+    summary_path = build_artifact_path(
+        "realdb_verify",
+        run_id,
+        root_dir=config.settings["workloads_dir"],
+    )
+    write_json(summary_path, summary)
+    return summary_path
 
 
 def build_argument_parser():
@@ -2234,6 +3034,7 @@ def build_argument_parser():
             MODE_REPLAY_ONLY,
             MODE_REPORT_ONLY,
             MODE_CHECK_CONFIG,
+            MODE_VERIFY_REALDB,
         ],
         help="Execution mode",
     )
@@ -2251,6 +3052,49 @@ def build_argument_parser():
         type=int,
         default=None,
         help="Maximum row count to verify before skipping result comparison",
+    )
+    parser.add_argument(
+        "--plsql-profile",
+        action="store_true",
+        help="Enable DBMS_PROFILER sampling for replayed PL/SQL statements",
+    )
+    parser.add_argument(
+        "--plsql-profile-top-n",
+        type=int,
+        default=None,
+        help="Maximum profiler hot lines to persist per replayed PL/SQL statement",
+    )
+    parser.add_argument(
+        "--plsql-profile-source-context",
+        type=int,
+        default=None,
+        help="Profiler source context lines to include around each hot line",
+    )
+    parser.add_argument(
+        "--realdb-oracle-config",
+        help="Optional reference config.ini path for Oracle-source real DB validation",
+    )
+    parser.add_argument(
+        "--realdb-ob-source-config",
+        help="Optional reference config.ini.ob path for OceanBase-source real DB validation",
+    )
+    parser.add_argument(
+        "--realdb-deploy-profile-package",
+        action="store_true",
+        help="Deploy and execute a small profiler test package during verify-realdb mode",
+    )
+    parser.add_argument(
+        "--realdb-profile-package-sql",
+        help="Optional SQL file to deploy instead of the built-in profiler test package",
+    )
+    parser.add_argument(
+        "--realdb-profile-package-call",
+        help="Optional PL/SQL call text to execute for profiler validation",
+    )
+    parser.add_argument(
+        "--realdb-cleanup-profile-package",
+        action="store_true",
+        help="Drop the built-in profiler test package after verify-realdb completes",
     )
     parser.add_argument("--top-n", type=int, default=None, help="Override top-N regression count")
     parser.add_argument("--min-exec", type=int, default=None, help="Override minimum execution count")
@@ -2285,6 +3129,9 @@ def apply_cli_overrides(config, args):
         "duration": args.duration,
         "verify_results": True if getattr(args, "verify_results", False) else None,
         "result_sample_limit": getattr(args, "result_sample_limit", None),
+        "plsql_profile": True if getattr(args, "plsql_profile", False) else None,
+        "plsql_profile_top_n": getattr(args, "plsql_profile_top_n", None),
+        "plsql_profile_source_context": getattr(args, "plsql_profile_source_context", None),
         "timeout_factor": args.timeout_factor,
         "slowdown_threshold": args.slowdown_threshold,
         "interval": args.interval,
@@ -2322,6 +3169,14 @@ def main(argv=None):
     if args.mode == MODE_CHECK_CONFIG:
         LOG.info("Configuration is valid")
         return 0
+    if args.mode == MODE_VERIFY_REALDB:
+        try:
+            summary_path = run_realdb_verification(config, args, run_id)
+            LOG.info("Real DB verification complete: %s", summary_path)
+            return 0
+        except Exception:
+            LOG.exception("Unhandled runtime error during real DB verification")
+            return 1
     if args.mode == MODE_REPLAY_ONLY and not args.workload:
         LOG.error("--workload is required for replay-only mode")
         return 2
