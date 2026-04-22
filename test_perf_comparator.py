@@ -1532,6 +1532,17 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
             side_effect=responses,
         ) as obclient_mock, mock.patch.object(
             perf_comparator,
+            "_load_plsql_source_lines",
+            return_value={
+                "lines": {18: "FOR i IN 1..500000 LOOP"},
+                "source_view": "DBA_SOURCE",
+                "source_layout": "line_rows",
+                "source_mapping_strategy": "dba_source_line_rows",
+                "source_mapping_confidence": "high",
+                "ob_version": "4.2.5.7",
+            },
+        ), mock.patch.object(
+            perf_comparator,
             "_fetch_plsql_source_context",
             return_value=[],
         ):
@@ -1549,6 +1560,85 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
             sql for sql in executed_sql if "DBMS_PROFILER.OB_INIT_OBJECTS(FALSE)" in sql
         ]
         self.assertEqual(len(init_calls), 1)
+
+    def test_get_oceanbase_version_caches_probe_result(self):
+        config = self._build_config(plsql_profile=True)
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            return_value=(True, "4.2.5.7\n", ""),
+        ) as obclient_mock:
+            first = perf_comparator.get_oceanbase_version(config)
+            second = perf_comparator.get_oceanbase_version(config)
+
+        self.assertEqual(first, "4.2.5.7")
+        self.assertEqual(second, "4.2.5.7")
+        self.assertEqual(obclient_mock.call_count, 1)
+
+    def test_load_plsql_source_lines_reconstructs_single_row_dba_source_blob(self):
+        config = self._build_config(plsql_profile=True)
+        encoded_source = (
+            "1\tCREATE OR REPLACE PACKAGE BODY TEST_PROFILER_PKG AS\x1f"
+            "  PROCEDURE run_workload IS\x1f"
+            "  BEGIN\x1f"
+            "    FOR i IN 1..500000 LOOP\x1f"
+            "      NULL;\x1f"
+            "    END LOOP;\x1f"
+            "  END;\x1f"
+            "END;\n"
+        )
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            side_effect=[
+                (True, "4.2.5.7\n", ""),
+                (True, encoded_source, ""),
+            ],
+        ):
+            source_info = perf_comparator._load_plsql_source_lines(
+                config,
+                "OMS_USER",
+                "TEST_PROFILER_PKG",
+                "PACKAGE BODY",
+            )
+
+        self.assertEqual(source_info["ob_version"], "4.2.5.7")
+        self.assertEqual(source_info["source_view"], "DBA_SOURCE")
+        self.assertEqual(source_info["source_layout"], "single_row_clob")
+        self.assertEqual(source_info["source_mapping_strategy"], "dba_source_blob_split")
+        self.assertEqual(source_info["source_mapping_confidence"], "medium")
+        self.assertEqual(source_info["lines"][4], "    FOR i IN 1..500000 LOOP")
+
+    def test_load_plsql_source_lines_falls_back_to_all_source_line_rows(self):
+        config = self._build_config(plsql_profile=True)
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            side_effect=[
+                (True, "4.2.5.7\n", ""),
+                (False, "", "ORA-00942: table or view does not exist"),
+                (
+                    True,
+                    "17\tFOR i IN 1..500000 LOOP\n18\t  NULL;\n",
+                    "",
+                ),
+            ],
+        ):
+            source_info = perf_comparator._load_plsql_source_lines(
+                config,
+                "OMS_USER",
+                "TEST_PROFILER_PKG",
+                "PACKAGE BODY",
+            )
+
+        self.assertEqual(source_info["source_view"], "ALL_SOURCE")
+        self.assertEqual(source_info["source_layout"], "line_rows")
+        self.assertEqual(source_info["source_mapping_confidence"], "high")
+        self.assertEqual(source_info["lines"][17], "FOR i IN 1..500000 LOOP")
+        self.assertEqual(source_info["lines"][18], "  NULL;")
 
     def test_collect_plsql_profile_skips_when_profiler_init_fails(self):
         config = self._build_config(plsql_profile=True)
@@ -2090,6 +2180,85 @@ class PerfComparatorCliTests(unittest.TestCase):
             html_text = html_path.read_text(encoding="utf-8")
             self.assertIn("plan-risk=LOOKUP-RISK", html_text)
             self.assertIn("plsql=TEST_PROFILER_PKG", html_text)
+
+    def test_report_only_mode_surfaces_plsql_profile_mapping_confidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153500.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153500.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "pkg-map-1",
+                    "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+                    "baseline_avg_elapsed_us": 1000.0,
+                    "baseline_avg_logical_reads": 20.0,
+                },
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                {
+                    "sql_id": "pkg-map-1",
+                    "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+                    "ob_status": "ok",
+                    "ob_elapsed_us": 2600.0,
+                    "ob_net_time_us": 1200.0,
+                    "ob_plan_type_raw": "3",
+                    "plsql_profile_status": "ok",
+                    "plsql_profile_top_lines": [
+                        {
+                            "owner": "OMS_USER",
+                            "unit_name": "TEST_PROFILER_PKG",
+                            "unit_type": "PACKAGE BODY",
+                            "line": 18,
+                            "source_text": "FOR i IN 1..500000 LOOP",
+                            "source_mapping_strategy": "dba_source_blob_split",
+                            "source_mapping_confidence": "medium",
+                            "source_view": "DBA_SOURCE",
+                            "source_layout": "single_row_clob",
+                            "ob_version": "4.2.5.7",
+                        }
+                    ],
+                },
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+            self.assertEqual(exit_code, 0)
+            html_path = next(report_dir.glob("perf_report_*.html"))
+            summary_path = next(report_dir.glob("perf_report_*_summary.txt"))
+            hints_path = next(report_dir.glob("perf_hints_*.sql"))
+            html_text = html_path.read_text(encoding="utf-8")
+            summary_text = summary_path.read_text(encoding="utf-8")
+            hints_text = hints_path.read_text(encoding="utf-8")
+            self.assertIn("plsql-map=medium@dba_source_blob_split", html_text)
+            self.assertIn("plsql_map=medium@dba_source_blob_split", summary_text)
+            self.assertIn("-- plsql-profile-map: medium@dba_source_blob_split", hints_text)
 
     def test_report_only_mode_renders_chart_sections(self):
         with tempfile.TemporaryDirectory() as tmpdir:

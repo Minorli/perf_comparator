@@ -8,4 +8,4 @@ Verified mismatches: 0
 Verified skipped: 0
 
 Top regressions:
-1. sql_id=sql-1 speedup_ratio=0.333 baseline_us=1000.0 ob_us=3000.0 rules=SLOWDOWN,DIST-JOIN,PLAN-CHANGED verification=n/a monitor=n/a plan_risk=n/a plsql=n/a
+1. sql_id=sql-1 speedup_ratio=0.333 baseline_us=1000.0 ob_us=3000.0 rules=SLOWDOWN,DIST-JOIN,PLAN-CHANGED verification=n/a monitor=n/a plan_risk=n/a plsql=n/a plsql_map=n/a

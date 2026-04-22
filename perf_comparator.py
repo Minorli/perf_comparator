@@ -60,6 +60,8 @@ DEFAULT_PLSQL_PROFILE_TOP_N = 10
 DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT = 1
 DEFAULT_OCP_TIMEOUT = 15
 DEFAULT_OBDIAG_TIMEOUT = 120
+SOURCE_TEXT_CR_SENTINEL = "\x1e"
+SOURCE_TEXT_LF_SENTINEL = "\x1f"
 
 SECTION_ORACLE_SOURCE = "ORACLE_SOURCE"
 SECTION_OCEANBASE_SOURCE = "OCEANBASE_SOURCE"
@@ -1780,6 +1782,23 @@ def summarize_plsql_profile(row):
         top_line.get("line") or "?",
         str(top_line.get("source_text") or "").strip()[:80],
     )
+
+
+def summarize_plsql_profile_mapping(row):
+    # type: (Dict[str, Any]) -> str
+    if row.get("plsql_profile_mapping_summary"):
+        return str(row.get("plsql_profile_mapping_summary"))
+    if row.get("plsql_profile_status") != "ok":
+        return "n/a"
+    top_lines = row.get("plsql_profile_top_lines") or []
+    if not top_lines:
+        return "n/a"
+    top_line = top_lines[0]
+    confidence = str(top_line.get("source_mapping_confidence") or "").strip()
+    strategy = str(top_line.get("source_mapping_strategy") or "").strip()
+    if confidence and strategy:
+        return "%s@%s" % (confidence, strategy)
+    return confidence or strategy or "n/a"
 
 
 def _sanitize_filename_fragment(value):
@@ -3944,6 +3963,195 @@ def _escape_sql_string(value):
     return str(value or "").replace("'", "''")
 
 
+def _parse_version_string(version_text):
+    # type: (Any) -> Optional[str]
+    for raw_line in str(version_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.upper() == "OB_VERSION()":
+            continue
+        if "." in line and line.replace(".", "").replace("-", "").isdigit():
+            return line.split("-", 1)[0]
+    return None
+
+
+def get_oceanbase_version(config):
+    # type: (AppConfig) -> Optional[str]
+    cached = config.settings.get("_ob_version")
+    if cached is not None:
+        return str(cached or "").strip() or None
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        "SELECT OB_VERSION() FROM DUAL",
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    version = _parse_version_string(stdout if ok else "")
+    config.settings["_ob_version"] = version or ""
+    return version
+
+
+def _decode_source_text_fragment(value):
+    # type: (Any) -> str
+    return (
+        str(value or "")
+        .replace(SOURCE_TEXT_LF_SENTINEL, "\n")
+        .replace(SOURCE_TEXT_CR_SENTINEL, "\r")
+    )
+
+
+def _normalize_source_line_text(value):
+    # type: (Any) -> str
+    return str(value or "").replace("\r", "")
+
+
+def _split_source_blob_text(value):
+    # type: (Any) -> List[str]
+    normalized = _decode_source_text_fragment(value).replace("\r\n", "\n")
+    parts = normalized.split("\n")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    return [_normalize_source_line_text(part) for part in parts]
+
+
+def _query_plsql_source_rows(config, source_view, owner, unit_name, unit_type):
+    # type: (AppConfig, str, str, str, str) -> Dict[str, Any]
+    query = """
+        SELECT
+          LINE,
+          REPLACE(REPLACE(TEXT, CHR(13), CHR(30)), CHR(10), CHR(31))
+        FROM {source_view}
+        WHERE OWNER = '{owner}'
+          AND NAME = '{unit_name}'
+          AND TYPE = '{unit_type}'
+        ORDER BY LINE
+    """.format(
+        source_view=source_view,
+        owner=_escape_sql_string(owner),
+        unit_name=_escape_sql_string(unit_name),
+        unit_type=_escape_sql_string(unit_type),
+    )
+    ok, stdout, stderr = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok:
+        return {"rows": [], "error": (stderr or stdout or "").strip(), "source_view": source_view}
+    rows = []
+    for raw_line in (stdout or "").splitlines():
+        fields = raw_line.split("\t", 1)
+        if not fields:
+            continue
+        line_value = _safe_int(fields[0])
+        if line_value is None:
+            continue
+        rows.append(
+            {
+                "line": line_value,
+                "text": _decode_source_text_fragment(fields[1] if len(fields) > 1 else ""),
+            }
+        )
+    return {"rows": rows, "error": "", "source_view": source_view}
+
+
+def _build_plsql_source_line_map(source_rows):
+    # type: (List[Dict[str, Any]]) -> Tuple[Dict[int, str], str]
+    if not source_rows:
+        return {}, "unavailable"
+    if len(source_rows) == 1 and "\n" in str(source_rows[0].get("text") or ""):
+        line_map = {}
+        base_line = max(1, int(source_rows[0].get("line") or 1))
+        for offset, line_text in enumerate(_split_source_blob_text(source_rows[0].get("text"))):
+            line_map[base_line + offset] = line_text
+        return line_map, "single_row_clob"
+    if any("\n" in str(row.get("text") or "") for row in source_rows):
+        line_map = {}
+        for row in source_rows:
+            base_line = max(1, int(row.get("line") or 1))
+            split_lines = _split_source_blob_text(row.get("text"))
+            if not split_lines:
+                line_map[base_line] = ""
+                continue
+            for offset, line_text in enumerate(split_lines):
+                line_map[base_line + offset] = line_text
+        return line_map, "embedded_newlines"
+    return {
+        int(row.get("line") or 0): _normalize_source_line_text(row.get("text"))
+        for row in source_rows
+        if _safe_int(row.get("line")) is not None
+    }, "line_rows"
+
+
+def _source_mapping_strategy_for_layout(source_view, source_layout):
+    # type: (str, str) -> str
+    source_key = str(source_view or "").strip().lower()
+    if source_layout == "line_rows":
+        return "%s_line_rows" % source_key
+    if source_layout in ("single_row_clob", "embedded_newlines"):
+        return "%s_blob_split" % source_key
+    return "none"
+
+
+def _source_mapping_confidence_for_layout(source_layout):
+    # type: (str) -> str
+    if source_layout == "line_rows":
+        return "high"
+    if source_layout in ("single_row_clob", "embedded_newlines"):
+        return "medium"
+    return "none"
+
+
+def _load_plsql_source_lines(config, owner, unit_name, unit_type):
+    # type: (AppConfig, str, str, str) -> Dict[str, Any]
+    cache = config.settings.setdefault("_plsql_source_cache", {})
+    cache_key = "%s|%s|%s" % (owner, unit_name, unit_type)
+    if cache_key in cache:
+        return dict(cache[cache_key])
+    ob_version = get_oceanbase_version(config)
+    errors = []
+    for source_view in ("DBA_SOURCE", "ALL_SOURCE"):
+        query_result = _query_plsql_source_rows(config, source_view, owner, unit_name, unit_type)
+        if query_result.get("error"):
+            errors.append("%s:%s" % (source_view, query_result.get("error")))
+        source_rows = query_result.get("rows") or []
+        if not source_rows:
+            continue
+        line_map, source_layout = _build_plsql_source_line_map(source_rows)
+        source_info = {
+            "owner": owner,
+            "unit_name": unit_name,
+            "unit_type": unit_type,
+            "lines": line_map,
+            "source_view": source_view,
+            "source_layout": source_layout,
+            "source_mapping_strategy": _source_mapping_strategy_for_layout(source_view, source_layout),
+            "source_mapping_confidence": _source_mapping_confidence_for_layout(source_layout),
+            "ob_version": ob_version or "unknown",
+            "source_errors": errors,
+        }
+        cache[cache_key] = dict(source_info)
+        return source_info
+    source_info = {
+        "owner": owner,
+        "unit_name": unit_name,
+        "unit_type": unit_type,
+        "lines": {},
+        "source_view": "",
+        "source_layout": "unavailable",
+        "source_mapping_strategy": "none",
+        "source_mapping_confidence": "none",
+        "ob_version": ob_version or "unknown",
+        "source_errors": errors,
+    }
+    cache[cache_key] = dict(source_info)
+    return source_info
+
+
 def _probe_plsql_profiler_capability(config):
     # type: (AppConfig) -> Dict[str, Any]
     query = """
@@ -3961,11 +4169,26 @@ def _probe_plsql_profiler_capability(config):
         ),
     )
     if not ok:
-        return {"available": False, "status": "unavailable", "error": stderr or stdout}
+        return {
+            "available": False,
+            "status": "unavailable",
+            "error": stderr or stdout,
+            "ob_version": get_oceanbase_version(config) or "unknown",
+        }
     count_value = _safe_int((stdout or "").splitlines()[0].split("\t")[0] if stdout.strip() else None) or 0
     if count_value > 0:
-        return {"available": True, "status": "ready", "error": ""}
-    return {"available": False, "status": "unavailable", "error": "DBMS_PROFILER package not found"}
+        return {
+            "available": True,
+            "status": "ready",
+            "error": "",
+            "ob_version": get_oceanbase_version(config) or "unknown",
+        }
+    return {
+        "available": False,
+        "status": "unavailable",
+        "error": "DBMS_PROFILER package not found",
+        "ob_version": get_oceanbase_version(config) or "unknown",
+    }
 
 
 def _probe_ocp_capability(config):
@@ -4111,44 +4334,17 @@ def _lookup_plsql_profile_runid(config, profiler_comment):
     return _safe_int(first_line)
 
 
-def _fetch_plsql_source_context(config, owner, unit_name, unit_type, line_no, context_size):
-    # type: (AppConfig, str, str, str, int, int) -> List[Dict[str, Any]]
+def _fetch_plsql_source_context(config, owner, unit_name, unit_type, line_no, context_size, source_info=None):
+    # type: (AppConfig, str, str, str, int, int, Optional[Dict[str, Any]]) -> List[Dict[str, Any]]
+    source_payload = dict(source_info or _load_plsql_source_lines(config, owner, unit_name, unit_type))
+    line_map = source_payload.get("lines") or {}
     low_line = max(1, int(line_no) - max(0, int(context_size or 0)))
     high_line = int(line_no) + max(0, int(context_size or 0))
-    query = """
-        SELECT LINE, TEXT
-        FROM ALL_SOURCE
-        WHERE OWNER = '{owner}'
-          AND NAME = '{unit_name}'
-          AND TYPE = '{unit_type}'
-          AND LINE BETWEEN {low_line} AND {high_line}
-        ORDER BY LINE
-    """.format(
-        owner=_escape_sql_string(owner),
-        unit_name=_escape_sql_string(unit_name),
-        unit_type=_escape_sql_string(unit_type),
-        low_line=low_line,
-        high_line=high_line,
-    )
-    ok, stdout, _ = obclient_run_sql(
-        config.oceanbase_target,
-        query,
-        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
-        session_query_timeout_us=config.settings.get(
-            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
-        ),
-    )
-    if not ok or not stdout.strip():
-        return []
     context_rows = []
-    for raw_line in stdout.splitlines():
-        fields = raw_line.split("\t", 1)
-        if len(fields) < 2:
+    for line_value in range(low_line, high_line + 1):
+        if line_value not in line_map:
             continue
-        line_value = _safe_int(fields[0])
-        if line_value is None:
-            continue
-        context_rows.append({"line": line_value, "text": fields[1]})
+        context_rows.append({"line": line_value, "text": line_map.get(line_value) or ""})
     return context_rows
 
 
@@ -4162,17 +4358,11 @@ def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
             u.UNIT_TYPE,
             d.LINE#,
             d.TOTAL_OCCUR,
-            d.TOTAL_TIME,
-            s.TEXT
+            d.TOTAL_TIME
           FROM PLSQL_PROFILER_UNITS u
           JOIN PLSQL_PROFILER_DATA d
             ON d.RUNID = u.RUNID
            AND d.UNIT_NUMBER = u.UNIT_NUMBER
-          LEFT JOIN ALL_SOURCE s
-            ON s.OWNER = u.UNIT_OWNER
-           AND s.NAME = u.UNIT_NAME
-           AND s.TYPE = u.UNIT_TYPE
-           AND s.LINE = d.LINE#
           WHERE u.RUNID = {runid}
           ORDER BY d.TOTAL_TIME DESC, d.LINE#
         ) WHERE ROWNUM <= {top_n}
@@ -4190,12 +4380,17 @@ def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
     hot_lines = []
     for raw_line in stdout.splitlines():
         fields = raw_line.split("\t")
-        if len(fields) < 7:
+        if len(fields) < 6:
             continue
         line_no = _safe_int(fields[3])
         if line_no is None:
             continue
-        source_text = fields[6]
+        source_info = _load_plsql_source_lines(config, fields[0], fields[1], fields[2])
+        source_map = source_info.get("lines") or {}
+        source_text = source_map.get(line_no) or ""
+        mapping_confidence = source_info.get("source_mapping_confidence") or "none"
+        if not source_text:
+            mapping_confidence = "low" if source_map else "none"
         row = {
             "owner": fields[0],
             "unit_name": fields[1],
@@ -4204,6 +4399,12 @@ def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
             "total_occur": _safe_int(fields[4]),
             "total_time_us": _safe_float(fields[5]),
             "source_text": source_text,
+            "source_mapping_strategy": source_info.get("source_mapping_strategy") or "none",
+            "source_mapping_confidence": mapping_confidence,
+            "source_view": source_info.get("source_view") or "",
+            "source_layout": source_info.get("source_layout") or "unavailable",
+            "ob_version": source_info.get("ob_version") or "unknown",
+            "source_line_hit": bool(source_text),
         }
         if int(context_size or 0) > 0:
             row["context_lines"] = _fetch_plsql_source_context(
@@ -4213,6 +4414,7 @@ def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
                 fields[2],
                 line_no,
                 int(context_size or 0),
+                source_info=source_info,
             )
             if str(source_text or "").strip().upper() == "NULL" and row["context_lines"]:
                 matched_context = [
@@ -4290,6 +4492,9 @@ def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
             "runid": runid,
             "profiler_comment": profiler_comment,
             "top_lines": top_lines,
+            "source_mapping_summary": summarize_plsql_profile_mapping(
+                {"plsql_profile_status": "ok", "plsql_profile_top_lines": top_lines}
+            ),
             "captured_at": utc_now_iso(),
         },
     )
@@ -4299,6 +4504,9 @@ def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
         "runid": runid,
         "top_lines": top_lines,
         "artifact_path": str(artifact_path),
+        "mapping_summary": summarize_plsql_profile_mapping(
+            {"plsql_profile_status": "ok", "plsql_profile_top_lines": top_lines}
+        ),
     }
 
 
@@ -4431,6 +4639,14 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
         merged["plsql_profile_artifact_path"] = plsql_profile.get("artifact_path")
         merged["plsql_profile_top_lines"] = plsql_profile.get("top_lines") or []
         merged["plsql_profile_summary"] = summarize_plsql_profile(
+            {
+                "plsql_profile_status": plsql_profile.get("status"),
+                "plsql_profile_top_lines": plsql_profile.get("top_lines") or [],
+            }
+        )
+        merged["plsql_profile_mapping_summary"] = plsql_profile.get(
+            "mapping_summary"
+        ) or summarize_plsql_profile_mapping(
             {
                 "plsql_profile_status": plsql_profile.get("status"),
                 "plsql_profile_top_lines": plsql_profile.get("top_lines") or [],
@@ -4663,6 +4879,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         base["plan_diff_signals"] = replay_row.get("plan_diff_signals") or build_plan_diff_signals(base)
         if "plsql_profile_summary" not in base:
             base["plsql_profile_summary"] = summarize_plsql_profile(base)
+        if "plsql_profile_mapping_summary" not in base:
+            base["plsql_profile_mapping_summary"] = summarize_plsql_profile_mapping(base)
         base["recommendations"] = build_recommendations(
             base,
             slowdown_threshold=float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD)),
@@ -4711,9 +4929,10 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         plan_monitor_summary = summarize_plan_monitor_evidence(row)
         plan_risk_summary = summarize_plan_diff_signals(row)
         plsql_profile_summary = summarize_plsql_profile(row)
+        plsql_profile_mapping_summary = summarize_plsql_profile_mapping(row)
         external_summary = summarize_external_diagnostics(row)
         summary_line = (
-            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s plan_risk=%s plsql=%s"
+            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s plan_risk=%s plsql=%s plsql_map=%s"
             % (
                 idx,
                 row.get("sql_id"),
@@ -4725,6 +4944,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 plan_monitor_summary,
                 plan_risk_summary,
                 plsql_profile_summary,
+                plsql_profile_mapping_summary,
             )
         )
         if external_summary != "n/a":
@@ -4738,6 +4958,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         plan_monitor_summary = summarize_plan_monitor_evidence(row)
         plan_risk_summary = summarize_plan_diff_signals(row)
         plsql_profile_summary = summarize_plsql_profile(row)
+        plsql_profile_mapping_summary = summarize_plsql_profile_mapping(row)
         external_summary = summarize_external_diagnostics(row)
         evidence_parts = [
             "verification=%s" % verification_status,
@@ -4745,6 +4966,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
             "plan-risk=%s" % plan_risk_summary,
             "plsql=%s" % plsql_profile_summary,
         ]
+        if plsql_profile_mapping_summary != "n/a":
+            evidence_parts.append("plsql-map=%s" % plsql_profile_mapping_summary)
         if external_summary != "n/a":
             evidence_parts.append(external_summary)
         html_rows.append(
@@ -4806,6 +5029,9 @@ svg text { font-family: Arial, sans-serif; fill: #1a202c; }
             hints_lines.append(
                 "-- plsql-profile: %s" % summarize_plsql_profile(row)
             )
+            hints_lines.append(
+                "-- plsql-profile-map: %s" % summarize_plsql_profile_mapping(row)
+            )
         external_summary = summarize_external_diagnostics(row)
         if external_summary != "n/a":
             hints_lines.append("-- external-diagnostics: %s" % external_summary)
@@ -4848,6 +5074,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
                 row["plan_monitor_rows"] = []
         row["plan_diff_signals"] = build_plan_diff_signals(row)
         row["plsql_profile_summary"] = summarize_plsql_profile(row)
+        row["plsql_profile_mapping_summary"] = summarize_plsql_profile_mapping(row)
         row["recommendations"] = build_recommendations(row, slowdown_threshold=slowdown_threshold)
 
     enriched_rows = sorted(
