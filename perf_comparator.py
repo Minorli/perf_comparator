@@ -957,21 +957,53 @@ def get_source_actor_fields(config_or_settings):
     return actor_fields or list(DEFAULT_SOURCE_ACTOR_FIELDS)
 
 
-def build_source_actor_key(row, actor_fields):
-    # type: (Dict[str, Any], Sequence[str]) -> str
+def build_source_fallback_actor_key(row):
+    # type: (Dict[str, Any]) -> str
+    fallback_values = [
+        ("schema", str(row.get("schema") or "").strip()),
+        ("sql_id", str(row.get("sql_id") or "").strip()),
+    ]
+    parts = ["%s=%s" % (name, value) for name, value in fallback_values if value]
+    return " | ".join(parts) or "unattributed"
+
+
+def has_source_actor_attribution(row, actor_fields):
+    # type: (Dict[str, Any], Sequence[str]) -> bool
+    for field_name in actor_fields:
+        key = "source_%s" % str(field_name or "").strip().lower()
+        value = str(row.get(key) or row.get(field_name) or "").strip()
+        if value:
+            return True
+    return False
+
+
+def build_source_actor_key(row, actor_fields, allow_fallback=True):
+    # type: (Dict[str, Any], Sequence[str], bool) -> str
     parts = []
     for field_name in actor_fields:
         key = "source_%s" % str(field_name or "").strip().lower()
         value = str(row.get(key) or row.get(field_name) or "").strip()
         if value:
             parts.append("%s=%s" % (field_name, value))
-    if not parts:
-        fallback_values = [
-            ("schema", str(row.get("schema") or "").strip()),
-            ("sql_id", str(row.get("sql_id") or "").strip()),
-        ]
-        parts = ["%s=%s" % (name, value) for name, value in fallback_values if value]
-    return " | ".join(parts) or "unattributed"
+    if parts:
+        return " | ".join(parts)
+    if not allow_fallback:
+        return ""
+    return build_source_fallback_actor_key(row)
+
+
+def summarize_source_attribution(row):
+    # type: (Dict[str, Any]) -> str
+    quality = str(row.get("source_attribution_quality") or "unattributed")
+    direct = int(row.get("source_direct_sample_count") or 0)
+    fallback = int(row.get("source_fallback_sample_count") or 0)
+    if quality == "mixed":
+        return "mixed(direct=%d,fallback=%d)" % (direct, fallback)
+    if quality == "direct":
+        return "direct(%d)" % direct
+    if quality == "fallback":
+        return "fallback(%d)" % fallback
+    return quality
 
 
 def summarize_source_likely_cause(row):
@@ -996,28 +1028,48 @@ def summarize_source_likely_cause(row):
 def compute_source_actor_summaries(rows):
     # type: (List[Dict[str, Any]]) -> List[Dict[str, Any]]
     grouped = {}
+    direct_available = any(row.get("source_direct_actor_summaries") for row in rows)
     for row in rows:
-        actor_key = str(row.get("source_primary_actor") or "").strip() or "unattributed"
-        entry = grouped.get(actor_key)
-        if entry is None:
-            entry = {
-                "actor": actor_key,
-                "statement_count": 0,
-                "sql_count": 0,
-                "plsql_count": 0,
-                "sample_count": 0,
-                "total_elapsed_us": 0.0,
-                "max_avg_elapsed_us": 0.0,
-            }
-            grouped[actor_key] = entry
-        entry["statement_count"] += 1
-        entry["sample_count"] += int(row.get("source_sample_count") or 0)
-        entry["total_elapsed_us"] += float(row.get("source_total_elapsed_us") or 0.0)
-        entry["max_avg_elapsed_us"] = max(entry["max_avg_elapsed_us"], float(row.get("ob_elapsed_us") or 0.0))
-        if str(row.get("source_workload_type") or "sql") == "plsql":
-            entry["plsql_count"] += 1
-        else:
-            entry["sql_count"] += 1
+        actor_summaries = (
+            row.get("source_direct_actor_summaries")
+            if direct_available
+            else (row.get("source_direct_actor_summaries") or row.get("source_fallback_actor_summaries"))
+        ) or []
+        actor_sample_total = (
+            int(row.get("source_direct_sample_count") or 0)
+            if direct_available
+            else int(row.get("source_direct_sample_count") or row.get("source_fallback_sample_count") or 0)
+        )
+        if not actor_summaries:
+            continue
+        denominator = max(1, actor_sample_total)
+        total_elapsed_us = float(row.get("source_total_elapsed_us") or 0.0)
+        for actor_summary in actor_summaries:
+            actor_key = str(actor_summary.get("actor") or "").strip() or "unattributed"
+            sample_count = int(actor_summary.get("count") or 0)
+            if sample_count <= 0:
+                continue
+            entry = grouped.get(actor_key)
+            if entry is None:
+                entry = {
+                    "actor": actor_key,
+                    "statement_count": 0,
+                    "sql_count": 0,
+                    "plsql_count": 0,
+                    "sample_count": 0,
+                    "total_elapsed_us": 0.0,
+                    "max_avg_elapsed_us": 0.0,
+                    "attribution_scope": "direct" if direct_available else "fallback",
+                }
+                grouped[actor_key] = entry
+            entry["statement_count"] += 1
+            entry["sample_count"] += sample_count
+            entry["total_elapsed_us"] += total_elapsed_us * (float(sample_count) / float(denominator))
+            entry["max_avg_elapsed_us"] = max(entry["max_avg_elapsed_us"], float(row.get("ob_elapsed_us") or 0.0))
+            if str(row.get("source_workload_type") or "sql") == "plsql":
+                entry["plsql_count"] += 1
+            else:
+                entry["sql_count"] += 1
     return sorted(
         grouped.values(),
         key=lambda item: (-float(item.get("total_elapsed_us") or 0.0), -int(item.get("sample_count") or 0), str(item.get("actor") or "")),
@@ -4230,7 +4282,8 @@ def aggregate_ob_source_workload_rows(workload_rows):
                 * sample_increment
             )
         actor_fields = row.get("source_actor_fields") or list(DEFAULT_SOURCE_ACTOR_FIELDS)
-        actor_key = build_source_actor_key(row, actor_fields)
+        actor_key = build_source_actor_key(row, actor_fields, allow_fallback=False)
+        fallback_actor_key = build_source_fallback_actor_key(row)
         workload_type = classify_source_workload_type(sql_text)
         key = str(row.get("sql_id") or compute_sql_id(sql_text))
         entry = grouped.get(key)
@@ -4264,6 +4317,7 @@ def aggregate_ob_source_workload_rows(workload_rows):
                 "captured_at": row.get("captured_at"),
                 "source_sql_text_source": row.get("source_sql_text_source") or row.get("source_sql_text_status"),
                 "source_actor_counts": {},
+                "source_fallback_actor_counts": {},
                 "source_actor_fields": list(actor_fields),
                 "source_workload_type": workload_type,
                 "source_tenant_name": row.get("source_tenant_name"),
@@ -4303,7 +4357,12 @@ def aggregate_ob_source_workload_rows(workload_rows):
         entry["source_total_bloom_filter_filtered"] += float(row.get("source_ob_bloom_filter_filtered") or 0.0) * sample_increment
         entry["source_plan_miss_count"] += 0 if _is_truthy_flag(row.get("source_ob_is_hit_plan")) else sample_increment
         entry["source_rpc_count"] += sample_increment if _is_truthy_flag(row.get("source_ob_is_executor_rpc")) else 0
-        entry["source_actor_counts"][actor_key] = int(entry["source_actor_counts"].get(actor_key, 0) or 0) + sample_increment
+        if actor_key:
+            entry["source_actor_counts"][actor_key] = int(entry["source_actor_counts"].get(actor_key, 0) or 0) + sample_increment
+        else:
+            entry["source_fallback_actor_counts"][fallback_actor_key] = int(
+                entry["source_fallback_actor_counts"].get(fallback_actor_key, 0) or 0
+            ) + sample_increment
         if workload_type == "plsql":
             entry["source_workload_type"] = "plsql"
         if row.get("plsql_profile_status") and not entry.get("plsql_profile_status"):
@@ -4343,12 +4402,32 @@ def aggregate_ob_source_workload_rows(workload_rows):
     for entry in grouped.values():
         sample_count = max(1, int(entry.get("source_sample_count") or 1))
         actor_counts = entry.get("source_actor_counts") or {}
+        fallback_actor_counts = entry.get("source_fallback_actor_counts") or {}
         sorted_actor_counts = sorted(
             actor_counts.items(),
             key=lambda item: (-int(item[1] or 0), item[0]),
         )
-        primary_actor = sorted_actor_counts[0][0] if sorted_actor_counts else "unattributed"
-        primary_actor_count = int(sorted_actor_counts[0][1] or 0) if sorted_actor_counts else 0
+        sorted_fallback_actor_counts = sorted(
+            fallback_actor_counts.items(),
+            key=lambda item: (-int(item[1] or 0), item[0]),
+        )
+        direct_sample_count = sum(int(count or 0) for _, count in sorted_actor_counts)
+        fallback_sample_count = sum(int(count or 0) for _, count in sorted_fallback_actor_counts)
+        if sorted_actor_counts:
+            primary_actor = sorted_actor_counts[0][0]
+            primary_actor_count = int(sorted_actor_counts[0][1] or 0)
+            attribution_quality = "mixed" if sorted_fallback_actor_counts else "direct"
+            effective_actor_summaries = sorted_actor_counts
+        elif sorted_fallback_actor_counts:
+            primary_actor = sorted_fallback_actor_counts[0][0]
+            primary_actor_count = int(sorted_fallback_actor_counts[0][1] or 0)
+            attribution_quality = "fallback"
+            effective_actor_summaries = sorted_fallback_actor_counts
+        else:
+            primary_actor = "unattributed"
+            primary_actor_count = 0
+            attribution_quality = "unattributed"
+            effective_actor_summaries = []
         aggregated = {
             "sql_id": entry.get("sql_id"),
             "sql_text": entry.get("sql_text"),
@@ -4380,12 +4459,25 @@ def aggregate_ob_source_workload_rows(workload_rows):
             "source_sql_text_source": entry.get("source_sql_text_source"),
             "source_workload_type": entry.get("source_workload_type") or classify_source_workload_type(entry.get("sql_text")),
             "source_actor_fields": entry.get("source_actor_fields") or list(DEFAULT_SOURCE_ACTOR_FIELDS),
-            "source_actor_count": len(sorted_actor_counts),
+            "source_actor_count": len(effective_actor_summaries),
             "source_primary_actor": primary_actor,
             "source_primary_actor_count": primary_actor_count,
-            "source_actor_summaries": [
+            "source_attribution_quality": attribution_quality,
+            "source_direct_sample_count": direct_sample_count,
+            "source_fallback_sample_count": fallback_sample_count,
+            "source_direct_actor_count": len(sorted_actor_counts),
+            "source_fallback_actor_count": len(sorted_fallback_actor_counts),
+            "source_direct_actor_summaries": [
                 {"actor": actor, "count": int(count)}
                 for actor, count in sorted_actor_counts[:5]
+            ],
+            "source_fallback_actor_summaries": [
+                {"actor": actor, "count": int(count)}
+                for actor, count in sorted_fallback_actor_counts[:5]
+            ],
+            "source_actor_summaries": [
+                {"actor": actor, "count": int(count)}
+                for actor, count in effective_actor_summaries[:5]
             ],
             "source_first_seen_at": entry.get("source_first_seen_at"),
             "source_last_seen_at": entry.get("source_last_seen_at") or entry.get("captured_at"),
@@ -5906,7 +5998,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
             )
         )
     slow_sql_rows_html = "".join(
-        "<tr><td>{sql_id}</td><td>{elapsed}</td><td><pre>{sql}</pre></td></tr>".format(
+        "<tr><td><a href=\"#sql-{sql_anchor}\">{sql_id}</a></td><td>{elapsed}</td><td><pre>{sql}</pre></td></tr>".format(
+            sql_anchor=html.escape(str(row.get("sql_id"))),
             sql_id=html.escape(str(row.get("sql_id"))),
             elapsed=html.escape(str(row.get("ob_elapsed_us"))),
             sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
@@ -5914,13 +6007,56 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         for row in top_sql_rows
     )
     slow_plsql_rows_html = "".join(
-        "<tr><td>{sql_id}</td><td>{elapsed}</td><td>{diag}</td><td><pre>{sql}</pre></td></tr>".format(
+        "<tr><td><a href=\"#sql-{sql_anchor}\">{sql_id}</a></td><td>{elapsed}</td><td>{diag}</td><td><pre>{sql}</pre></td></tr>".format(
+            sql_anchor=html.escape(str(row.get("sql_id"))),
             sql_id=html.escape(str(row.get("sql_id"))),
             elapsed=html.escape(str(row.get("ob_elapsed_us"))),
             diag=html.escape(summarize_plsql_profile_diagnosis(row)),
             sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
         )
         for row in top_plsql_rows
+    )
+    detail_cards_html = "".join(
+        """<section id="sql-{sql_id}" class="detail-card">
+<h3>SQL ID {sql_id}</h3>
+<p><a href="#top">Back to Top</a></p>
+<p>Type: {workload_type}</p>
+<p>Speedup Ratio: {speedup}</p>
+<p>Baseline Avg (us): {oracle}</p>
+<p>OB Elapsed (us): {ob}</p>
+<p>Evidence: {evidence}</p>
+<details><summary>SQL Text</summary><pre>{sql_text}</pre></details>
+</section>""".format(
+            sql_id=html.escape(str(row.get("sql_id"))),
+            workload_type=html.escape(str(row.get("replay_workload_type") or "sql")),
+            speedup=html.escape(_format_ratio(row.get("speedup_ratio"))),
+            oracle=html.escape(str(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us"))),
+            ob=html.escape(str(row.get("ob_elapsed_us"))),
+            evidence=html.escape(
+                " | ".join(
+                    ([
+                        "verification=%s" % summarize_verification_evidence(row),
+                        "monitor=%s" % summarize_plan_monitor_evidence(row),
+                        "plan-risk=%s" % summarize_plan_diff_signals(row),
+                        "plsql=%s" % summarize_plsql_profile(row),
+                    ] + (
+                        ["plsql-map=%s" % summarize_plsql_profile_mapping(row)]
+                        if summarize_plsql_profile_mapping(row) != "n/a"
+                        else []
+                    ) + (
+                        ["plsql-diag=%s" % summarize_plsql_profile_diagnosis(row)]
+                        if summarize_plsql_profile_diagnosis(row) != "n/a"
+                        else []
+                    ) + (
+                        [summarize_external_diagnostics(row)]
+                        if summarize_external_diagnostics(row) != "n/a"
+                        else []
+                    ))
+                )
+            ),
+            sql_text=html.escape(str(row.get("sql_text") or "")),
+        )
+        for row in selected_rows
     )
     charts_html = _render_svg_distribution_chart(enriched_rows, "distribution-chart")
     charts_html += _render_svg_timing_chart(selected_rows, "timing-chart", source_only=False)
@@ -5932,12 +6068,15 @@ table { border-collapse: collapse; width: 100%%; }
 th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
 th { background: #f4f4f4; text-align: left; }
 pre { white-space: pre-wrap; margin: 0; }
+.nav-block { border: 1px solid #cbd5e0; background: #f7fafc; padding: 12px; margin: 0 0 20px 0; }
+.detail-card { border-top: 2px solid #cbd5e0; padding-top: 16px; margin-top: 20px; }
 .chart-block { margin-bottom: 20px; }
 svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 </style></head><body>
-<h1>perf_comparator report</h1>
+<a id="top"></a><h1>perf_comparator report</h1>
 <p>Run ID: %s</p>
 <p>Mode: %s</p>
+<div id="report-nav" class="nav-block"><h2>Navigation</h2><ul><li><a href="#overview-charts">Overview</a></li><li><a href="#slow-sql-section">Top Slow SQL</a></li><li><a href="#slow-plsql-section">Top Slow PL/SQL</a></li><li><a href="#detailed-findings">Detailed Findings</a></li></ul></div>
 %s
 <div id="slow-sql-section" class="chart-block">
 <h2>Top Slow SQL</h2>
@@ -5947,16 +6086,14 @@ svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 <h2>Top Slow PL/SQL</h2>
 <table><thead><tr><th>SQL ID</th><th>OB Elapsed (us)</th><th>Diagnosis</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
 </div>
-<table>
-<thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Baseline Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
-<tbody>%s</tbody></table></body></html>
+<section id="detailed-findings"><h2>Detailed Findings</h2>%s</section></body></html>
 """ % (
         html.escape(run_id),
         html.escape("oracle-to-ob-rolling" if rolling_mode else "oracle-to-ob"),
         charts_html,
         slow_sql_rows_html,
         slow_plsql_rows_html,
-        "".join(html_rows),
+        detail_cards_html,
     )
     write_text(html_path, html_content)
 
@@ -6041,6 +6178,13 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     visibility_warning = build_query_sql_visibility_warning(config)
     sql_source_counts = compute_sql_text_source_distribution(enriched_rows)
     actor_summaries = compute_source_actor_summaries(enriched_rows)
+    caller_scope = str(actor_summaries[0].get("attribution_scope") or "fallback") if actor_summaries else "fallback"
+    direct_stmt_count = sum(
+        1 for row in enriched_rows if str(row.get("source_attribution_quality") or "") in ("direct", "mixed")
+    )
+    fallback_stmt_count = sum(
+        1 for row in enriched_rows if str(row.get("source_attribution_quality") or "") == "fallback"
+    )
     rolling_mode = bool(config.settings.get("_rolling_source_report"))
     slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
     for row in enriched_rows:
@@ -6120,6 +6264,8 @@ def generate_report_from_source_workload(config, workload_path, run_id):
             len(actor_summaries),
             ",".join(get_source_actor_fields(config)),
         ),
+        "Caller attribution coverage: direct_or_mixed=%d fallback_only=%d top_callers_scope=%s"
+        % (direct_stmt_count, fallback_stmt_count, caller_scope),
         "Observed workload types: sql=%d plsql=%d"
         % (
             sum(1 for row in enriched_rows if str(row.get("source_workload_type") or "sql") != "plsql"),
@@ -6150,12 +6296,13 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     )
     for idx, row in enumerate(top_sql_rows, 1):
         summary_lines.append(
-            "%d. actor=%s sql_id=%s avg_elapsed_us=%s cause=%s sql=%s"
+            "%d. actor=%s sql_id=%s avg_elapsed_us=%s attribution=%s cause=%s sql=%s"
             % (
                 idx,
                 row.get("source_primary_actor") or "unattributed",
                 row.get("sql_id"),
                 row.get("ob_elapsed_us"),
+                summarize_source_attribution(row),
                 summarize_source_likely_cause(row),
                 build_sql_preview(row.get("sql_text"), limit=120),
             )
@@ -6168,12 +6315,13 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     )
     for idx, row in enumerate(top_plsql_rows, 1):
         summary_lines.append(
-            "%d. actor=%s sql_id=%s avg_elapsed_us=%s cause=%s sql=%s"
+            "%d. actor=%s sql_id=%s avg_elapsed_us=%s attribution=%s cause=%s sql=%s"
             % (
                 idx,
                 row.get("source_primary_actor") or "unattributed",
                 row.get("sql_id"),
                 row.get("ob_elapsed_us"),
+                summarize_source_attribution(row),
                 summarize_source_likely_cause(row),
                 build_sql_preview(row.get("sql_text"), limit=120),
             )
@@ -6194,12 +6342,13 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
         external_summary = summarize_external_diagnostics(row)
         summary_line = (
-            "%d. sql_id=%s type=%s actor=%s samples=%s avg_elapsed_us=%s total_elapsed_us=%s rules=%s monitor=%s plan_risk=%s cause=%s"
+            "%d. sql_id=%s type=%s actor=%s attribution=%s samples=%s avg_elapsed_us=%s total_elapsed_us=%s rules=%s monitor=%s plan_risk=%s cause=%s"
             % (
                 idx,
                 row.get("sql_id"),
                 row.get("source_workload_type") or "sql",
                 row.get("source_primary_actor") or "unattributed",
+                summarize_source_attribution(row),
                 row.get("source_sample_count"),
                 row.get("ob_elapsed_us"),
                 row.get("source_total_elapsed_us"),
@@ -6226,6 +6375,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         external_summary = summarize_external_diagnostics(row)
         evidence_parts = [
             "actor=%s" % (row.get("source_primary_actor") or "unattributed"),
+            "attribution=%s" % summarize_source_attribution(row),
             "type=%s" % (row.get("source_workload_type") or "sql"),
             "cause=%s" % summarize_source_likely_cause(row),
             "monitor=%s" % summarize_plan_monitor_evidence(row),
@@ -6254,8 +6404,9 @@ def generate_report_from_source_workload(config, workload_path, run_id):
             )
         )
     caller_rows_html = "".join(
-        "<tr><td>{actor}</td><td>{samples}</td><td>{elapsed}</td><td>{statements}</td><td>{sql_count}</td><td>{plsql_count}</td></tr>".format(
+        "<tr><td>{actor}</td><td>{scope}</td><td>{samples}</td><td>{elapsed}</td><td>{statements}</td><td>{sql_count}</td><td>{plsql_count}</td></tr>".format(
             actor=html.escape(str(actor.get("actor"))),
+            scope=html.escape(str(actor.get("attribution_scope") or "fallback")),
             samples=html.escape(str(actor.get("sample_count"))),
             elapsed=html.escape(str(int(actor.get("total_elapsed_us") or 0.0))),
             statements=html.escape(str(actor.get("statement_count"))),
@@ -6265,24 +6416,63 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         for actor in actor_summaries[:8]
     )
     slow_sql_rows_html = "".join(
-        "<tr><td>{actor}</td><td>{sql_id}</td><td>{elapsed}</td><td>{cause}</td><td><pre>{sql}</pre></td></tr>".format(
+        "<tr><td>{actor}</td><td><a href=\"#sql-{sql_anchor}\">{sql_id}</a></td><td>{elapsed}</td><td>{attribution}</td><td>{cause}</td><td><pre>{sql}</pre></td></tr>".format(
             actor=html.escape(str(row.get("source_primary_actor") or "unattributed")),
+            sql_anchor=html.escape(str(row.get("sql_id"))),
             sql_id=html.escape(str(row.get("sql_id"))),
             elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            attribution=html.escape(summarize_source_attribution(row)),
             cause=html.escape(summarize_source_likely_cause(row)),
             sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
         )
         for row in top_sql_rows
     )
     slow_plsql_rows_html = "".join(
-        "<tr><td>{actor}</td><td>{sql_id}</td><td>{elapsed}</td><td>{cause}</td><td><pre>{sql}</pre></td></tr>".format(
+        "<tr><td>{actor}</td><td><a href=\"#sql-{sql_anchor}\">{sql_id}</a></td><td>{elapsed}</td><td>{attribution}</td><td>{cause}</td><td><pre>{sql}</pre></td></tr>".format(
             actor=html.escape(str(row.get("source_primary_actor") or "unattributed")),
+            sql_anchor=html.escape(str(row.get("sql_id"))),
             sql_id=html.escape(str(row.get("sql_id"))),
             elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            attribution=html.escape(summarize_source_attribution(row)),
             cause=html.escape(summarize_source_likely_cause(row)),
             sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
         )
         for row in top_plsql_rows
+    )
+    detail_cards_html = "".join(
+        """<section id="sql-{sql_id}" class="detail-card">
+<h3>SQL ID {sql_id}</h3>
+<p><a href="#top">Back to Top</a></p>
+<p>Actor: {actor}</p>
+<p>Attribution: {attribution}</p>
+<p>Type: {workload_type}</p>
+<p>Samples: {samples}</p>
+<p>Avg Elapsed (us): {avg_elapsed}</p>
+<p>Total Elapsed (us): {total_elapsed}</p>
+<p>Cause: {cause}</p>
+<p>Evidence: {evidence}</p>
+<details><summary>SQL Text</summary><pre>{sql_text}</pre></details>
+</section>""".format(
+            sql_id=html.escape(str(row.get("sql_id"))),
+            actor=html.escape(str(row.get("source_primary_actor") or "unattributed")),
+            attribution=html.escape(summarize_source_attribution(row)),
+            workload_type=html.escape(str(row.get("source_workload_type") or "sql")),
+            samples=html.escape(str(row.get("source_sample_count"))),
+            avg_elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            total_elapsed=html.escape(str(row.get("source_total_elapsed_us"))),
+            cause=html.escape(summarize_source_likely_cause(row)),
+            evidence=html.escape(
+                " | ".join(
+                    [
+                        "monitor=%s" % summarize_plan_monitor_evidence(row),
+                        "plan-risk=%s" % summarize_plan_diff_signals(row),
+                        "rules=%s" % (",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"),
+                    ]
+                )
+            ),
+            sql_text=html.escape(str(row.get("sql_text") or "")),
+        )
+        for row in selected_rows
     )
     charts_html = _render_svg_distribution_chart(enriched_rows, "source-distribution-chart")
     charts_html += _render_svg_sql_source_chart(sql_source_counts, "sql-source-chart")
@@ -6302,30 +6492,31 @@ th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
 th { background: #f4f4f4; text-align: left; }
 pre { white-space: pre-wrap; margin: 0; }
  .chart-block { margin-bottom: 20px; }
+ .nav-block { border: 1px solid #cbd5e0; background: #f7fafc; padding: 12px; margin: 0 0 20px 0; }
+ .detail-card { border-top: 2px solid #cbd5e0; padding-top: 16px; margin-top: 20px; }
  .warning-block { border: 1px solid #c53030; background: #fff5f5; color: #742a2a; padding: 12px; margin: 0 0 20px 0; }
  svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 </style></head><body>
-<h1>perf_comparator source-only report</h1>
+<a id="top"></a><h1>perf_comparator source-only report</h1>
 <p>Run ID: %s</p>
 <p>Mode: source-only</p>
 <p>Caller fields: %s</p>
+<div id="report-nav" class="nav-block"><h2>Navigation</h2><ul><li><a href="#overview-charts">Overview</a></li><li><a href="#top-caller-groups">Top Caller Groups</a></li><li><a href="#slow-sql-section">Top Slow SQL</a></li><li><a href="#slow-plsql-section">Top Slow PL/SQL</a></li><li><a href="#detailed-findings">Detailed Findings</a></li></ul></div>
 %s
 %s
 <div id="top-caller-groups" class="chart-block">
 <h2>Top Caller Groups</h2>
-<table><thead><tr><th>Actor</th><th>Samples</th><th>Total Elapsed (us)</th><th>Statements</th><th>SQL</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
+<table><thead><tr><th>Actor</th><th>Scope</th><th>Samples</th><th>Total Elapsed (us)</th><th>Statements</th><th>SQL</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
 </div>
 <div id="slow-sql-section" class="chart-block">
 <h2>Top Slow SQL</h2>
-<table><thead><tr><th>Actor</th><th>SQL ID</th><th>Avg Elapsed (us)</th><th>Cause</th><th>SQL</th></tr></thead><tbody>%s</tbody></table>
+<table><thead><tr><th>Actor</th><th>SQL ID</th><th>Avg Elapsed (us)</th><th>Attribution</th><th>Cause</th><th>SQL</th></tr></thead><tbody>%s</tbody></table>
 </div>
 <div id="slow-plsql-section" class="chart-block">
 <h2>Top Slow PL/SQL</h2>
-<table><thead><tr><th>Actor</th><th>SQL ID</th><th>Avg Elapsed (us)</th><th>Cause</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
+<table><thead><tr><th>Actor</th><th>SQL ID</th><th>Avg Elapsed (us)</th><th>Attribution</th><th>Cause</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
 </div>
-<table>
-<thead><tr><th>SQL ID</th><th>Samples</th><th>Avg Elapsed (us)</th><th>Total Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
-<tbody>%s</tbody></table></body></html>
+<section id="detailed-findings"><h2>Detailed Findings</h2>%s</section></body></html>
 """ % (
         html.escape(run_id),
         html.escape(",".join(get_source_actor_fields(config))),
@@ -6334,7 +6525,7 @@ pre { white-space: pre-wrap; margin: 0; }
         caller_rows_html,
         slow_sql_rows_html,
         slow_plsql_rows_html,
-        "".join(html_rows),
+        detail_cards_html,
     )
     write_text(html_path, html_content)
 
@@ -6406,6 +6597,7 @@ pre { white-space: pre-wrap; margin: 0; }
         hints_lines.append("-- sql_id: %s" % row.get("sql_id"))
         hints_lines.append("-- samples: %s" % row.get("source_sample_count"))
         hints_lines.append("-- actor: %s" % (row.get("source_primary_actor") or "unattributed"))
+        hints_lines.append("-- attribution: %s" % summarize_source_attribution(row))
         hints_lines.append("-- workload_type: %s" % (row.get("source_workload_type") or "sql"))
         hints_lines.append("-- cause: %s" % summarize_source_likely_cause(row))
         hints_lines.append(

@@ -1348,6 +1348,44 @@ class PerfComparatorOracleCaptureTests(unittest.TestCase):
         self.assertIn("QA_FINANCE", row["source_primary_actor"])
         self.assertEqual(row["source_actor_count"], 1)
 
+    def test_aggregate_source_workload_rows_prefers_direct_actor_over_fallback(self):
+        rows = [
+            {
+                "sql_id": "sql-mixed-1",
+                "sql_text": "SELECT * FROM orders",
+                "source_execution_count": 2,
+                "baseline_avg_elapsed_us": 3000.0,
+                "oracle_avg_elapsed_us": 3000.0,
+                "source_ob_queue_time_us": 100.0,
+                "source_ob_execute_time_us": 2900.0,
+                "source_tenant_name": "ob4ora",
+                "source_db_name": "observer147",
+                "source_user_name": "QA_FINANCE",
+                "source_user_client_ip": "172.16.0.21",
+            },
+            {
+                "sql_id": "sql-mixed-1",
+                "sql_text": "SELECT * FROM orders",
+                "source_execution_count": 5,
+                "baseline_avg_elapsed_us": 5000.0,
+                "oracle_avg_elapsed_us": 5000.0,
+                "source_ob_queue_time_us": 100.0,
+                "source_ob_execute_time_us": 4900.0,
+                "schema": "OMS_USER",
+            },
+        ]
+
+        aggregated = perf_comparator.aggregate_ob_source_workload_rows(rows)
+
+        self.assertEqual(len(aggregated), 1)
+        row = aggregated[0]
+        self.assertIn("QA_FINANCE", row["source_primary_actor"])
+        self.assertEqual(row["source_attribution_quality"], "mixed")
+        self.assertEqual(row["source_direct_sample_count"], 2)
+        self.assertEqual(row["source_fallback_sample_count"], 5)
+        self.assertEqual(row["source_direct_actor_count"], 1)
+        self.assertEqual(row["source_fallback_actor_count"], 1)
+
     def test_build_source_sqlstat_delta_rows_emits_missing_sql_ids(self):
         start_snapshot = {
             "sql-keep": {
@@ -3727,10 +3765,16 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn("Top slow PL/SQL:", summary_text)
             self.assertIn("QA_FINANCE", summary_text)
             self.assertIn("SETTLEMENT_PKG:88-95:row_by_row_sql_in_loop", summary_text)
+            self.assertIn("Caller attribution coverage:", summary_text)
             self.assertIn('id="top-caller-groups"', html_text)
+            self.assertIn('id="report-nav"', html_text)
+            self.assertIn('id="detailed-findings"', html_text)
+            self.assertIn('href="#sql-pkg-caller-1"', html_text)
+            self.assertIn('id="sql-pkg-caller-1"', html_text)
             self.assertIn('id="slow-plsql-section"', html_text)
             self.assertIn("-- top_callers:", hints_text)
             self.assertIn("-- slow_plsql:", hints_text)
+            self.assertIn("-- attribution:", hints_text)
 
     def test_replay_report_surfaces_top_sql_and_plsql_sections(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3813,8 +3857,12 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn("Top slow SQL:", summary_text)
             self.assertIn("Top slow PL/SQL:", summary_text)
             self.assertIn("SETTLEMENT_PKG:88-95:row_by_row_sql_in_loop", summary_text)
+            self.assertIn('id="report-nav"', html_text)
             self.assertIn('id="slow-sql-section"', html_text)
             self.assertIn('id="slow-plsql-section"', html_text)
+            self.assertIn('id="detailed-findings"', html_text)
+            self.assertIn('href="#sql-pkg-live-1"', html_text)
+            self.assertIn('id="sql-pkg-live-1"', html_text)
             self.assertIn("-- slow_sql:", hints_text)
             self.assertIn("-- slow_plsql:", hints_text)
 
