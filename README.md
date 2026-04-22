@@ -122,8 +122,13 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 - native OCP：
   - `ocp_base_url`
   - `ocp_authorization_env`
+  - `ocp_username`
+  - `ocp_password`
+  - `ocp_password_env`
   - `ocp_cluster_id`
   - `ocp_tenant_id`
+  - `ocp_cluster_name`
+  - `ocp_tenant_name`
   - `ocp_verify_tls`
   - `ocp_window_minutes`
   - `ocp_query_limit`
@@ -138,10 +143,30 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 说明：
 
 - 如果你使用的是标准 OCP `api/v2`，优先用 native OCP 配置，不需要手工拼 SQL endpoint
-- `ocp_authorization_env` 里放完整的 `Authorization` header 值，例如 `Basic ...` 或 `Bearer ...`
+- 认证优先级：
+  - `ocp_authorization_env`
+  - `ocp_username + ocp_password_env`
+  - `ocp_username + ocp_password`
+- 使用 `ocp_username + ocp_password(_env)` 时，程序会自动生成：
+  - `Authorization: Basic <base64(username:password)>`
+- 如果不想手填 `cluster_id/tenant_id`，可以改配：
+  - `ocp_cluster_name`
+  - `ocp_tenant_name`
+  程序会通过 `/api/v2/ob/clusters` 自动解析
 - 如果当前 OCP 只能通过 `curl -k` 访问，就把 `ocp_verify_tls = false`
 - OCP 集成优先走 native `api/v2` SQL endpoints，特殊环境仍可回退到 URL template 模式
 - obdiag 是可选能力，失败只会记到报告，不会阻塞主流程
+
+## Source-Only SQL 获取协同
+
+当 `source-report` 模式下普通用户看不到 `QUERY_SQL` 时，程序会按下面顺序补 SQL 文本：
+
+1. 直接使用源端采集到的 `QUERY_SQL`
+2. 使用 `[OCEANBASE_SOURCE_SYS]` 从 `GV$OB_SQLSTAT / GV$OB_PLAN_CACHE_PLAN_STAT / GV$OB_SQL_AUDIT` 回填
+3. 使用 native OCP `sql/{sqlId}/text`
+4. 使用模板式 OCP fallback
+
+报告里会标出每条 SQL 最终来自哪条链路。
 
 ## 产物
 

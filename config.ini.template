@@ -44,8 +44,13 @@ wcr_path =
 plsql_profile = false
 ocp_base_url =
 ocp_authorization_env =
+ocp_username =
+ocp_password =
+ocp_password_env =
 ocp_cluster_id =
 ocp_tenant_id =
+ocp_cluster_name =
+ocp_tenant_name =
 ocp_verify_tls = true
 ocp_window_minutes = 15
 ocp_query_limit = 20
@@ -66,6 +71,10 @@ obdiag_timeout = 120
 #   initialize profiler objects with DBMS_PROFILER.OB_INIT_OBJECTS(FALSE).
 # - Native OCP mode uses ocp_base_url + ocp_authorization_env + ocp_cluster_id +
 #   ocp_tenant_id, and can disable certificate verification with ocp_verify_tls=false.
+# - Native OCP auth can also be generated automatically from ocp_username +
+#   ocp_password or ocp_password_env.
+# - If cluster_id and tenant_id are omitted, the runtime can resolve them from
+#   ocp_cluster_name and ocp_tenant_name through /api/v2/ob/clusters.
 # - OCP integration is optional and driven by URL templates plus an auth token env var.
 # - obdiag integration is optional; configure the executable and any required extra args.
 # - source-report mode may omit [ORACLE_SOURCE] and [OCEANBASE_TARGET].

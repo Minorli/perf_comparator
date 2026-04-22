@@ -5,6 +5,7 @@ from __future__ import print_function
 
 import argparse
 import atexit
+import base64
 import configparser
 import hashlib
 import html
@@ -492,8 +493,13 @@ def load_config(config_path, execution_mode=None):
         "wcr_path": (settings_section.get("wcr_path") or "").strip(),
         "ocp_base_url": (settings_section.get("ocp_base_url") or "").strip(),
         "ocp_authorization_env": (settings_section.get("ocp_authorization_env") or "").strip(),
+        "ocp_username": (settings_section.get("ocp_username") or "").strip(),
+        "ocp_password": (settings_section.get("ocp_password") or "").strip(),
+        "ocp_password_env": (settings_section.get("ocp_password_env") or "").strip(),
         "ocp_cluster_id": (settings_section.get("ocp_cluster_id") or "").strip(),
         "ocp_tenant_id": (settings_section.get("ocp_tenant_id") or "").strip(),
+        "ocp_cluster_name": (settings_section.get("ocp_cluster_name") or "").strip(),
+        "ocp_tenant_name": (settings_section.get("ocp_tenant_name") or "").strip(),
         "ocp_verify_tls": str(settings_section.get("ocp_verify_tls") or "true").strip().lower()
         in ("1", "true", "yes", "on"),
         "ocp_window_minutes": _get_optional_int(settings_section, "ocp_window_minutes", 15),
@@ -912,6 +918,73 @@ def lookup_source_sql_texts(config, sql_ids):
     return resolved
 
 
+def lookup_sql_texts_via_ocp_native(config, sql_ids):
+    # type: (AppConfig, Sequence[str]) -> Dict[str, str]
+    capability = _probe_ocp_capability(config)
+    if capability.get("mode") != "native" or capability.get("status") != "ready":
+        return {}
+    resolved = {}
+    headers = _build_ocp_headers(config)
+    timeout_seconds = int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT))
+    report_dir = config.settings.get("report_dir") or config.settings.get("workloads_dir") or "."
+    run_id = str(config.settings.get("_current_run_id") or "ocp_lookup")
+    for sql_id in sql_ids:
+        sql_id = str(sql_id or "").strip()
+        if not sql_id:
+            continue
+        url = _build_ocp_native_sql_text_url(config, sql_id)
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            response = _open_ocp_request(config, request, timeout_seconds)
+            body = response.read().decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        artifact_path = _build_external_diagnostic_path(report_dir, run_id, sql_id, "sql_text_lookup", ".json")
+        write_text(artifact_path, body)
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {}
+        sql_text = ""
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, dict):
+                sql_text = str(_first_non_empty(data, ("sqlText", "sql_text", "text")) or "")
+            if not sql_text:
+                sql_text = str(_first_non_empty(payload, ("sqlText", "sql_text", "text")) or "")
+        if str(sql_text or "").strip():
+            resolved[sql_id] = sql_text
+    return resolved
+
+
+def lookup_sql_texts_via_ocp_template(config, sql_ids):
+    # type: (AppConfig, Sequence[str]) -> Dict[str, str]
+    template = str(config.settings.get("ocp_qpm_url_template") or config.settings.get("ocp_ash_url_template") or "").strip()
+    if not template:
+        return {}
+    resolved = {}
+    timeout_seconds = int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT))
+    report_dir = config.settings.get("report_dir") or config.settings.get("workloads_dir") or "."
+    run_id = str(config.settings.get("_current_run_id") or "ocp_lookup")
+    headers = _build_ocp_headers(config)
+    for sql_id in sql_ids:
+        sql_id = str(sql_id or "").strip()
+        if not sql_id:
+            continue
+        url = _format_external_template(template, {"sql_id": sql_id, "run_id": run_id})
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            response = _open_ocp_request(config, request, timeout_seconds)
+            body = response.read().decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        artifact_path = _build_external_diagnostic_path(report_dir, run_id, sql_id, "sql_template_lookup", ".txt")
+        write_text(artifact_path, body)
+        if str(body or "").strip():
+            resolved[sql_id] = str(body).strip()
+    return resolved
+
+
 def backfill_source_workload_sql_texts(config, workload_rows):
     # type: (AppConfig, List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
     lookup_cfg = get_source_sql_lookup_ob_cfg(config)
@@ -922,9 +995,16 @@ def backfill_source_workload_sql_texts(config, workload_rows):
             if sql_id:
                 missing_sql_ids.append(sql_id)
     lookup_map = lookup_source_sql_texts(config, missing_sql_ids) if missing_sql_ids else {}
+    remaining_sql_ids = [sql_id for sql_id in missing_sql_ids if sql_id not in lookup_map]
+    ocp_native_map = lookup_sql_texts_via_ocp_native(config, remaining_sql_ids) if remaining_sql_ids else {}
+    remaining_sql_ids = [sql_id for sql_id in remaining_sql_ids if sql_id not in ocp_native_map]
+    ocp_template_map = lookup_sql_texts_via_ocp_template(config, remaining_sql_ids) if remaining_sql_ids else {}
     stats = {
         "captured": 0,
         "backfilled": 0,
+        "backfilled_via_local": 0,
+        "backfilled_via_ocp_native": 0,
+        "backfilled_via_ocp_template": 0,
         "missing": 0,
         "lookup_user": str(lookup_cfg.get("user_string") or ""),
         "using_source_sys": bool(config.oceanbase_source_sys),
@@ -936,15 +1016,32 @@ def backfill_source_workload_sql_texts(config, workload_rows):
         raw_sql_text = updated.get("sql_text")
         if is_missing_sql_text(raw_sql_text):
             recovered_sql_text = lookup_map.get(sql_id, "")
+            recovered_source = ""
+            if recovered_sql_text:
+                recovered_source = "source_sys"
+            elif sql_id in ocp_native_map:
+                recovered_sql_text = ocp_native_map.get(sql_id, "")
+                recovered_source = "ocp_native"
+            elif sql_id in ocp_template_map:
+                recovered_sql_text = ocp_template_map.get(sql_id, "")
+                recovered_source = "ocp_template"
             if recovered_sql_text:
                 updated["sql_text"] = recovered_sql_text
                 updated["sql_text_normalized"] = normalize_sql_text(recovered_sql_text)
                 updated["source_sql_text_status"] = "backfilled"
+                updated["source_sql_text_source"] = recovered_source or "source_sys"
                 stats["backfilled"] += 1
+                if recovered_source == "ocp_native":
+                    stats["backfilled_via_ocp_native"] += 1
+                elif recovered_source == "ocp_template":
+                    stats["backfilled_via_ocp_template"] += 1
+                else:
+                    stats["backfilled_via_local"] += 1
             else:
                 updated["sql_text"] = ""
                 updated["sql_text_normalized"] = ""
                 updated["source_sql_text_status"] = "missing"
+                updated["source_sql_text_source"] = "missing"
                 stats["missing"] += 1
         else:
             sql_text = str(raw_sql_text)
@@ -953,6 +1050,7 @@ def backfill_source_workload_sql_texts(config, workload_rows):
                 updated.get("sql_text_normalized") or normalize_sql_text(sql_text)
             )
             updated["source_sql_text_status"] = "captured"
+            updated["source_sql_text_source"] = "captured"
             stats["captured"] += 1
         enriched_rows.append(updated)
     return enriched_rows, stats
@@ -1767,12 +1865,77 @@ def _build_external_context(row, run_id):
     }
 
 
+def _fetch_ocp_cluster_inventory(config):
+    # type: (AppConfig) -> List[Dict[str, Any]]
+    base_url = str(config.settings.get("ocp_base_url") or "").rstrip("/")
+    if not base_url:
+        return []
+    request = urllib.request.Request(
+        "%s/api/v2/ob/clusters" % base_url,
+        headers=_build_ocp_headers(config),
+    )
+    response = _open_ocp_request(
+        config,
+        request,
+        int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT)),
+    )
+    body = response.read().decode("utf-8", errors="ignore")
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return []
+    return _extract_ocp_contents(payload)
+
+
+def resolve_ocp_target_ids(config):
+    # type: (AppConfig) -> Dict[str, str]
+    cluster_id = str(config.settings.get("ocp_cluster_id") or "").strip()
+    tenant_id = str(config.settings.get("ocp_tenant_id") or "").strip()
+    if cluster_id and tenant_id:
+        return {"cluster_id": cluster_id, "tenant_id": tenant_id}
+    cached = config.settings.get("_resolved_ocp_target_ids")
+    if isinstance(cached, dict) and cached.get("cluster_id") and cached.get("tenant_id"):
+        return {
+            "cluster_id": str(cached.get("cluster_id")),
+            "tenant_id": str(cached.get("tenant_id")),
+        }
+    cluster_name = str(config.settings.get("ocp_cluster_name") or "").strip()
+    tenant_name = str(config.settings.get("ocp_tenant_name") or "").strip()
+    if not cluster_name or not tenant_name:
+        return {"cluster_id": cluster_id, "tenant_id": tenant_id}
+    inventory = _fetch_ocp_cluster_inventory(config)
+    for cluster in inventory:
+        if str(cluster.get("name") or "").strip() != cluster_name:
+            continue
+        resolved_cluster_id = str(cluster.get("id") or "").strip()
+        for tenant in cluster.get("tenants") or []:
+            if str(tenant.get("name") or "").strip() == tenant_name:
+                resolved = {
+                    "cluster_id": resolved_cluster_id,
+                    "tenant_id": str(tenant.get("id") or "").strip(),
+                }
+                config.settings["_resolved_ocp_target_ids"] = resolved
+                return resolved
+    return {"cluster_id": cluster_id, "tenant_id": tenant_id}
+
+
 def _build_ocp_headers(config):
     # type: (AppConfig) -> Dict[str, str]
     headers = {}
     authorization_env = str(config.settings.get("ocp_authorization_env") or "").strip()
     if authorization_env and os.environ.get(authorization_env):
         headers["Authorization"] = os.environ.get(authorization_env) or ""
+        return headers
+    username = str(config.settings.get("ocp_username") or "").strip()
+    password_env = str(config.settings.get("ocp_password_env") or "").strip()
+    password = ""
+    if password_env and os.environ.get(password_env):
+        password = os.environ.get(password_env) or ""
+    elif config.settings.get("ocp_password"):
+        password = str(config.settings.get("ocp_password") or "")
+    if username and password:
+        encoded = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
+        headers["Authorization"] = "Basic %s" % encoded
         return headers
     token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
     token_value = os.environ.get(token_env) if token_env else ""
@@ -1831,10 +1994,11 @@ def _build_ocp_native_base(config):
 
 def _build_ocp_native_sql_list_url(config, path_name, row):
     # type: (AppConfig, str, Dict[str, Any]) -> str
+    resolved = resolve_ocp_target_ids(config)
     replayed_at = _parse_iso_datetime(row.get("replayed_at") or row.get("captured_at")) or datetime.now(timezone.utc)
     if replayed_at.tzinfo is None:
         replayed_at = replayed_at.replace(tzinfo=timezone.utc)
-    window_minutes = max(1, int(config.settings.get("ocp_window_minutes", 15)))
+    window_minutes = max(1, min(1440, int(config.settings.get("ocp_window_minutes", 15))))
     start_time = replayed_at - timedelta(minutes=window_minutes)
     end_time = replayed_at + timedelta(minutes=window_minutes)
     query = {
@@ -1846,8 +2010,8 @@ def _build_ocp_native_sql_list_url(config, path_name, row):
     }
     return "%s/api/v2/ob/clusters/%s/tenants/%s/%s?%s" % (
         _build_ocp_native_base(config),
-        config.settings.get("ocp_cluster_id"),
-        config.settings.get("ocp_tenant_id"),
+        resolved.get("cluster_id"),
+        resolved.get("tenant_id"),
         path_name,
         urllib.parse.urlencode(query),
     )
@@ -1855,16 +2019,20 @@ def _build_ocp_native_sql_list_url(config, path_name, row):
 
 def _build_ocp_native_sql_text_url(config, ocp_sql_id):
     # type: (AppConfig, str) -> str
+    resolved = resolve_ocp_target_ids(config)
     return "%s/api/v2/ob/clusters/%s/tenants/%s/sql/%s/text" % (
         _build_ocp_native_base(config),
-        config.settings.get("ocp_cluster_id"),
-        config.settings.get("ocp_tenant_id"),
+        resolved.get("cluster_id"),
+        resolved.get("tenant_id"),
         urllib.parse.quote(str(ocp_sql_id or ""), safe=""),
     )
 
 
 def _collect_ocp_native_row_diagnostics(config, row, run_id):
     # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
+    resolved_ids = resolve_ocp_target_ids(config)
+    if not resolved_ids.get("cluster_id") or not resolved_ids.get("tenant_id"):
+        return {"status": "misconfigured", "summary": "native OCP cluster/tenant could not be resolved", "artifact_path": ""}
     context = _build_external_context(row, run_id)
     report_dir = config.settings["report_dir"]
     timeout_seconds = int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT))
@@ -2636,6 +2804,12 @@ def validate_runtime_paths(config):
     if has_ocp_templates and token_env and not os.environ.get(token_env):
         result.warnings.append("OCP auth token env is not set: %s" % token_env)
 
+    ocp_username = str(config.settings.get("ocp_username") or "").strip()
+    ocp_password_env = str(config.settings.get("ocp_password_env") or "").strip()
+    ocp_password = str(config.settings.get("ocp_password") or "").strip()
+    if ocp_username and not (ocp_password or (ocp_password_env and os.environ.get(ocp_password_env))):
+        result.warnings.append("OCP username is set but password or password env is missing")
+
     return result
 
 
@@ -3362,6 +3536,13 @@ def capture_workload_from_ob_source(config, args, run_id):
 def aggregate_ob_source_workload_rows(workload_rows):
     # type: (List[Dict[str, Any]]) -> List[Dict[str, Any]]
     grouped = {}  # type: Dict[str, Dict[str, Any]]
+    source_priority = {
+        "captured": 4,
+        "source_sys": 3,
+        "ocp_native": 2,
+        "ocp_template": 1,
+        "missing": 0,
+    }
     for row in workload_rows:
         sql_text = str(row.get("sql_text") or "")
         sample_increment = max(1, int(_safe_int(row.get("source_execution_count")) or 1))
@@ -3401,6 +3582,7 @@ def aggregate_ob_source_workload_rows(workload_rows):
                 "source_ob_request_id": row.get("source_ob_request_id"),
                 "source_ob_plan_type_raw": row.get("source_ob_plan_type_raw"),
                 "captured_at": row.get("captured_at"),
+                "source_sql_text_source": row.get("source_sql_text_source") or row.get("source_sql_text_status"),
             }
             grouped[key] = entry
         entry["source_sample_count"] += sample_increment
@@ -3432,6 +3614,10 @@ def aggregate_ob_source_workload_rows(workload_rows):
             entry["source_ob_trace_id"] = row.get("source_ob_trace_id")
             entry["source_ob_plan_type_raw"] = row.get("source_ob_plan_type_raw")
             entry["captured_at"] = row.get("captured_at")
+        row_source = str(row.get("source_sql_text_source") or row.get("source_sql_text_status") or "").strip() or "missing"
+        entry_source = str(entry.get("source_sql_text_source") or "").strip() or "missing"
+        if source_priority.get(row_source, 0) >= source_priority.get(entry_source, 0):
+            entry["source_sql_text_source"] = row_source
 
     aggregated_rows = []
     for entry in grouped.values():
@@ -3464,6 +3650,7 @@ def aggregate_ob_source_workload_rows(workload_rows):
             "ob_bloom_filter_filtered": float(entry.get("source_total_bloom_filter_filtered") or 0.0) / sample_count,
             "source_ob_trace_id": entry.get("source_ob_trace_id"),
             "source_ob_request_id": entry.get("source_ob_request_id"),
+            "source_sql_text_source": entry.get("source_sql_text_source"),
             "plan_monitor_rows": [],
         }
         aggregated.update(derive_replay_metrics(aggregated))
@@ -3727,18 +3914,27 @@ def _probe_ocp_capability(config):
     # type: (AppConfig) -> Dict[str, Any]
     base_url = str(config.settings.get("ocp_base_url") or "").strip()
     auth_env = str(config.settings.get("ocp_authorization_env") or "").strip()
+    username = str(config.settings.get("ocp_username") or "").strip()
+    password_env = str(config.settings.get("ocp_password_env") or "").strip()
+    password = str(config.settings.get("ocp_password") or "").strip()
     cluster_id = str(config.settings.get("ocp_cluster_id") or "").strip()
     tenant_id = str(config.settings.get("ocp_tenant_id") or "").strip()
-    if base_url or auth_env or cluster_id or tenant_id:
+    cluster_name = str(config.settings.get("ocp_cluster_name") or "").strip()
+    tenant_name = str(config.settings.get("ocp_tenant_name") or "").strip()
+    if base_url or auth_env or username or password_env or password or cluster_id or tenant_id or cluster_name or tenant_name:
         missing = []
         if not base_url:
             missing.append("ocp_base_url")
-        if not auth_env:
-            missing.append("ocp_authorization_env")
-        if not cluster_id:
-            missing.append("ocp_cluster_id")
-        if not tenant_id:
-            missing.append("ocp_tenant_id")
+        has_auth = False
+        if auth_env and os.environ.get(auth_env):
+            has_auth = True
+        elif username and ((password_env and os.environ.get(password_env)) or password):
+            has_auth = True
+        if not has_auth:
+            missing.append("ocp auth")
+        has_target = bool((cluster_id and tenant_id) or (cluster_name and tenant_name))
+        if not has_target:
+            missing.append("ocp cluster/tenant")
         if missing:
             return {
                 "available": False,
@@ -3746,21 +3942,14 @@ def _probe_ocp_capability(config):
                 "mode": "native",
                 "error": "missing native OCP settings: %s" % ", ".join(missing),
             }
-        if not os.environ.get(auth_env):
-            return {
-                "available": False,
-                "status": "misconfigured",
-                "mode": "native",
-                "error": "missing auth header env: %s" % auth_env,
-            }
         return {
             "available": True,
             "status": "ready",
             "mode": "native",
             "error": "",
             "base_url": base_url,
-            "cluster_id": cluster_id,
-            "tenant_id": tenant_id,
+            "cluster_id": cluster_id or cluster_name,
+            "tenant_id": tenant_id or tenant_name,
         }
     ash_template = str(config.settings.get("ocp_ash_url_template") or "").strip()
     qpm_template = str(config.settings.get("ocp_qpm_url_template") or "").strip()
@@ -4613,6 +4802,12 @@ def generate_report_from_source_workload(config, workload_path, run_id):
             int(sql_text_stats.get("missing", 0)),
             sql_text_stats.get("lookup_user") or "unconfigured",
         ),
+        "SQL text recovery detail: local=%d ocp_native=%d ocp_template=%d"
+        % (
+            int(sql_text_stats.get("backfilled_via_local", 0)),
+            int(sql_text_stats.get("backfilled_via_ocp_native", 0)),
+            int(sql_text_stats.get("backfilled_via_ocp_template", 0)),
+        ),
         "",
         "Top hotspots:",
     ]
@@ -4641,7 +4836,13 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         if external_summary != "n/a":
             summary_line = "%s external=%s" % (summary_line, external_summary)
         summary_lines.append(summary_line)
-        summary_lines.append("   sql: %s" % build_sql_preview(row.get("sql_text")))
+        summary_lines.append(
+            "   sql: [%s] %s"
+            % (
+                row.get("source_sql_text_source") or row.get("source_sql_text_status") or "unknown",
+                build_sql_preview(row.get("sql_text")),
+            )
+        )
     write_text(summary_path, "\n".join(summary_lines) + "\n")
 
     html_rows = []
@@ -4707,6 +4908,14 @@ pre { white-space: pre-wrap; margin: 0; }
             sql_text_stats.get("lookup_user") or "unconfigured",
         )
     )
+    hints_lines.append(
+        "-- sql_text_recovery_detail: local=%s ocp_native=%s ocp_template=%s"
+        % (
+            int(sql_text_stats.get("backfilled_via_local", 0)),
+            int(sql_text_stats.get("backfilled_via_ocp_native", 0)),
+            int(sql_text_stats.get("backfilled_via_ocp_template", 0)),
+        )
+    )
     if missing_sql_stmt_count > 0:
         hints_lines.append(
             "-- sql_text_note: configure [%s] and _enable_sql_audit_query_sql=true when QUERY_SQL is hidden from ordinary users"
@@ -4716,6 +4925,10 @@ pre { white-space: pre-wrap; margin: 0; }
     for row in selected_rows:
         hints_lines.append("-- sql_id: %s" % row.get("sql_id"))
         hints_lines.append("-- samples: %s" % row.get("source_sample_count"))
+        hints_lines.append(
+            "-- sql_text_source: %s"
+            % (row.get("source_sql_text_source") or row.get("source_sql_text_status") or "unknown")
+        )
         hints_lines.append("-- sql_preview: %s" % build_sql_preview(row.get("sql_text"), limit=240))
         hints_lines.append("-- monitor: %s" % summarize_plan_monitor_evidence(row))
         hints_lines.append("-- plan-risk: %s" % summarize_plan_diff_signals(row))

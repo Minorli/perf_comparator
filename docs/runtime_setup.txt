@@ -71,11 +71,17 @@ perf_comparator runtime setup
     - on first use the runtime will attempt `CALL DBMS_PROFILER.OB_INIT_OBJECTS(FALSE);`
   - native OCP mode:
     - `ocp_base_url = https://ocp.tidba.com:3600`
-    - `ocp_authorization_env = PERF_OCP_AUTH`
-    - `ocp_cluster_id = <clusterId>`
-    - `ocp_tenant_id = <tenantId>`
+    - auth:
+      - `ocp_authorization_env = PERF_OCP_AUTH`
+      - or `ocp_username` + `ocp_password_env`
+      - or `ocp_username` + `ocp_password`
+    - target:
+      - `ocp_cluster_id = <clusterId>` and `ocp_tenant_id = <tenantId>`
+      - or `ocp_cluster_name = <clusterName>` and `ocp_tenant_name = <tenantName>`
     - `ocp_verify_tls = false` if the deployment currently requires `curl -k`
     - the runtime will query official OCP SQL endpoints such as `topSql`, `slowSql`, and `sql/{sqlId}/text`
+    - the runtime generates `Authorization: Basic <base64(username:password)>` automatically when username/password mode is used
+    - when IDs are absent, the runtime resolves them through `/api/v2/ob/clusters`
   - `ocp_ash_url_template` / `ocp_qpm_url_template`
     - optional URL templates for OCP or operator-owned proxy endpoints
   - `ocp_auth_token_env`
@@ -130,3 +136,8 @@ perf_comparator runtime setup
   - example:
     - python3 perf_comparator.py --mode source-report --config config.ini --duration 900
   - when SQL text is hidden from ordinary users, the summary and hints will show a coverage note and recommend enabling `_enable_sql_audit_query_sql=true`
+  - SQL text recovery order is:
+    - captured `QUERY_SQL`
+    - `[OCEANBASE_SOURCE_SYS]` lookup
+    - native OCP SQL text lookup
+    - template-based OCP fallback

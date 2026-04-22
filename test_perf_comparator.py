@@ -333,6 +333,44 @@ class PerfComparatorConfigTests(unittest.TestCase):
             self.assertEqual(cfg.settings["ocp_window_minutes"], 30)
             self.assertEqual(cfg.settings["ocp_query_limit"], 10)
 
+    def test_load_config_parses_native_ocp_auth_and_name_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    ocp_base_url = https://ocp.tidba.com:3600
+                    ocp_username = admin
+                    ocp_password = PAssw0rd01##
+                    ocp_cluster_name = observer147
+                    ocp_tenant_name = ob4ora
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(str(config_path))
+
+            self.assertEqual(cfg.settings["ocp_username"], "admin")
+            self.assertEqual(cfg.settings["ocp_password"], "PAssw0rd01##")
+            self.assertEqual(cfg.settings["ocp_cluster_name"], "observer147")
+            self.assertEqual(cfg.settings["ocp_tenant_name"], "ob4ora")
+
 
 class PerfComparatorUtilityTests(unittest.TestCase):
     def test_parse_oracle_dsn(self):
@@ -459,6 +497,59 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertEqual(enriched_rows[0]["source_sql_text_status"], "backfilled")
         self.assertEqual(stats["backfilled"], 1)
         self.assertEqual(stats["lookup_user"], "SYS@ob4ora#observer147")
+
+    def test_backfill_source_workload_sql_texts_falls_back_to_native_ocp(self):
+        config = perf_comparator.AppConfig(
+            oracle_source={},
+            oceanbase_source={
+                "executable": "/bin/echo",
+                "host": "127.0.0.2",
+                "port": "2883",
+                "user_string": "app@test#obcluster",
+                "password": "source_secret",
+            },
+            oceanbase_target={},
+            settings={
+                "source_db_mode": "oceanbase",
+                "source_schemas": ["APP"],
+                "ocp_base_url": "https://ocp.tidba.com:3600",
+                "ocp_username": "admin",
+                "ocp_password": "PAssw0rd01##",
+                "ocp_cluster_name": "observer147",
+                "ocp_tenant_name": "ob4ora",
+                "report_dir": ".",
+            },
+            config_path="config.ini",
+            oceanbase_source_sys={},
+        )
+        rows = [
+            {
+                "sql_id": "A1B2C3",
+                "sql_text": "NULL",
+                "sql_text_normalized": "NULL",
+                "schema": "APP",
+            }
+        ]
+
+        with mock.patch.object(
+            perf_comparator,
+            "lookup_source_sql_texts",
+            return_value={},
+        ), mock.patch.object(
+            perf_comparator,
+            "lookup_sql_texts_via_ocp_native",
+            return_value={"A1B2C3": "SELECT * FROM orders WHERE status = 'ACTIVE'"},
+        ):
+            enriched_rows, stats = perf_comparator.backfill_source_workload_sql_texts(
+                config, rows
+            )
+
+        self.assertEqual(
+            enriched_rows[0]["sql_text"], "SELECT * FROM orders WHERE status = 'ACTIVE'"
+        )
+        self.assertEqual(enriched_rows[0]["source_sql_text_status"], "backfilled")
+        self.assertEqual(enriched_rows[0]["source_sql_text_source"], "ocp_native")
+        self.assertEqual(stats["backfilled_via_ocp_native"], 1)
 
     def test_build_recommendations_marks_slow_regression(self):
         row = {
@@ -874,6 +965,30 @@ class PerfComparatorOracleCaptureTests(unittest.TestCase):
         self.assertAlmostEqual(row["source_total_elapsed_us"], 5000.0)
         self.assertAlmostEqual(row["ob_elapsed_us"], 1000.0)
 
+    def test_aggregate_source_workload_rows_preserves_sql_text_source(self):
+        rows = [
+            {
+                "sql_id": "sql-1",
+                "sql_text": "SELECT * FROM orders",
+                "source_execution_count": 1,
+                "baseline_avg_elapsed_us": 1000.0,
+                "oracle_avg_elapsed_us": 1000.0,
+                "source_sql_text_source": "ocp_native",
+            },
+            {
+                "sql_id": "sql-1",
+                "sql_text": "SELECT * FROM orders",
+                "source_execution_count": 1,
+                "baseline_avg_elapsed_us": 1000.0,
+                "oracle_avg_elapsed_us": 1000.0,
+                "source_sql_text_source": "captured",
+            },
+        ]
+
+        aggregated = perf_comparator.aggregate_ob_source_workload_rows(rows)
+
+        self.assertEqual(aggregated[0]["source_sql_text_source"], "captured")
+
     def test_build_source_sqlstat_delta_rows_emits_missing_sql_ids(self):
         start_snapshot = {
             "sql-keep": {
@@ -1163,6 +1278,57 @@ class PerfComparatorObclientTests(unittest.TestCase):
 
         self.assertEqual(result["ocp"]["status"], "ready")
         self.assertEqual(result["ocp"]["mode"], "native")
+
+    def test_build_ocp_headers_generates_basic_auth_from_username_and_password(self):
+        cfg = perf_comparator.AppConfig(
+            oracle_source={},
+            oceanbase_source={},
+            oceanbase_target={},
+            settings={
+                "ocp_username": "admin",
+                "ocp_password": "PAssw0rd01##",
+            },
+            config_path="config.ini",
+        )
+
+        headers = perf_comparator._build_ocp_headers(cfg)
+
+        self.assertEqual(
+            headers["Authorization"], "Basic YWRtaW46UEFzc3cwcmQwMSMj"
+        )
+
+    def test_resolve_ocp_target_ids_uses_cluster_and_tenant_names(self):
+        cfg = perf_comparator.AppConfig(
+            oracle_source={},
+            oceanbase_source={},
+            oceanbase_target={},
+            settings={
+                "ocp_base_url": "https://ocp.tidba.com:3600",
+                "ocp_username": "admin",
+                "ocp_password": "PAssw0rd01##",
+                "ocp_cluster_name": "observer147",
+                "ocp_tenant_name": "ob4ora",
+                "ocp_verify_tls": False,
+                "ocp_timeout": 15,
+            },
+            config_path="config.ini",
+        )
+
+        with mock.patch.object(
+            perf_comparator,
+            "_fetch_ocp_cluster_inventory",
+            return_value=[
+                {
+                    "id": 11,
+                    "name": "observer147",
+                    "tenants": [{"id": 35, "name": "sys"}, {"id": 36, "name": "ob4ora"}],
+                }
+            ],
+        ):
+            resolved = perf_comparator.resolve_ocp_target_ids(cfg)
+
+        self.assertEqual(resolved["cluster_id"], "11")
+        self.assertEqual(resolved["tenant_id"], "36")
 
 
 class PerfComparatorReplayEvidenceTests(unittest.TestCase):
