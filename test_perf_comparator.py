@@ -638,6 +638,153 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertIn("MERGE INTO", recommendation_map["PLSQL-RPC"]["hint_sql"])
         self.assertIn("INSURANCE_WORKLOAD_PKG_SMALL", recommendation_map["PLSQL-RPC"]["hint_sql"])
 
+    def test_analyze_plsql_profile_evidence_detects_complex_package_patterns(self):
+        hot_lines = [
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "line": 87,
+                "total_occur": 20000,
+                "total_time_us": 1800000.0,
+                "source_text": "FOR rec IN c_orders LOOP",
+                "context_lines": [
+                    {"line": 86, "text": "FOR rec IN c_orders LOOP"},
+                    {"line": 87, "text": "  v_sql := 'UPDATE orders SET status = :1 WHERE id = :2';"},
+                    {"line": 88, "text": "  EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;"},
+                    {"line": 89, "text": "  UPDATE order_items SET synced_flag = 'Y' WHERE order_id = rec.order_id;"},
+                    {"line": 90, "text": "  COMMIT;"},
+                    {"line": 91, "text": "END LOOP;"},
+                ],
+            },
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "line": 88,
+                "total_occur": 20000,
+                "total_time_us": 2400000.0,
+                "source_text": "EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;",
+                "context_lines": [
+                    {"line": 87, "text": "FOR rec IN c_orders LOOP"},
+                    {"line": 88, "text": "  EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;"},
+                    {"line": 89, "text": "  UPDATE order_items SET synced_flag = 'Y' WHERE order_id = rec.order_id;"},
+                    {"line": 90, "text": "  COMMIT;"},
+                ],
+            },
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "line": 90,
+                "total_occur": 20000,
+                "total_time_us": 900000.0,
+                "source_text": "COMMIT;",
+                "context_lines": [
+                    {"line": 88, "text": "  EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;"},
+                    {"line": 89, "text": "  UPDATE order_items SET synced_flag = 'Y' WHERE order_id = rec.order_id;"},
+                    {"line": 90, "text": "  COMMIT;"},
+                    {"line": 91, "text": "END LOOP;"},
+                ],
+            },
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "line": 140,
+                "total_occur": 500000,
+                "total_time_us": 700000.0,
+                "source_text": "v_acc := v_acc + SQRT(i);",
+                "context_lines": [
+                    {"line": 139, "text": "FOR i IN 1..100000 LOOP"},
+                    {"line": 140, "text": "  v_acc := v_acc + SQRT(i);"},
+                    {"line": 141, "text": "END LOOP;"},
+                ],
+            },
+        ]
+        unit_summary = [
+            {
+                "owner": "OMS_USER",
+                "unit_name": "ORDER_SYNC_PKG",
+                "unit_type": "PACKAGE BODY",
+                "total_time_us": 6500000.0,
+                "total_occur": 560000,
+                "profile_time_ratio": 1.0,
+            }
+        ]
+
+        analysis = perf_comparator.analyze_plsql_profile_evidence(hot_lines, unit_summary)
+
+        self.assertEqual(analysis["unit_summary"][0]["unit_name"], "ORDER_SYNC_PKG")
+        self.assertEqual(analysis["hot_blocks"][0]["start_line"], 87)
+        self.assertEqual(analysis["hot_blocks"][0]["end_line"], 90)
+        diagnosis_ids = [item["diagnosis_id"] for item in analysis["diagnoses"]]
+        self.assertIn("dynamic_sql_in_loop", diagnosis_ids)
+        self.assertIn("frequent_commit_in_loop", diagnosis_ids)
+        self.assertIn("row_by_row_sql_in_loop", diagnosis_ids)
+        self.assertIn("tight_cpu_loop", diagnosis_ids)
+        self.assertIn("ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop", analysis["diagnosis_summary"])
+
+    def test_build_recommendations_emits_diagnosis_aware_plsql_rules(self):
+        row = {
+            "sql_id": "pkg-diag-1",
+            "sql_text": "BEGIN order_sync_pkg.run_batch; END",
+            "ob_status": "ok",
+            "speedup_ratio": 0.4,
+            "net_ratio": 0.7,
+            "plan_changed": False,
+            "ob_is_executor_rpc": "1",
+            "ob_queue_time_us": 200.0,
+            "ob_execute_time_us": 1000.0,
+            "ob_retry_cnt": 0,
+            "ob_is_hit_plan": "1",
+            "ob_get_plan_time_us": 20.0,
+            "ob_elapsed_us": 1200.0,
+            "ob_memstore_read_rows": 100.0,
+            "ob_ssstore_read_rows": 20.0,
+            "ob_bloom_filter_filtered": 0.0,
+            "plsql_profile_status": "ok",
+            "plsql_profile_diagnosis_summary": "ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop",
+            "plsql_profile_diagnoses": [
+                {
+                    "diagnosis_id": "dynamic_sql_in_loop",
+                    "unit_name": "ORDER_SYNC_PKG",
+                    "line_range": "87-90",
+                    "message": "Dynamic SQL is executed inside a hot loop.",
+                },
+                {
+                    "diagnosis_id": "frequent_commit_in_loop",
+                    "unit_name": "ORDER_SYNC_PKG",
+                    "line_range": "87-90",
+                    "message": "Commit appears inside a high-frequency loop.",
+                },
+            ],
+            "plsql_profile_top_lines": [
+                {
+                    "owner": "OMS_USER",
+                    "unit_name": "ORDER_SYNC_PKG",
+                    "unit_type": "PACKAGE BODY",
+                    "line": 88,
+                    "total_time_us": 2400000.0,
+                    "source_text": "EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;",
+                    "context_lines": [
+                        {"line": 87, "text": "FOR rec IN c_orders LOOP"},
+                        {"line": 88, "text": "  EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;"},
+                        {"line": 89, "text": "  UPDATE order_items SET synced_flag = 'Y' WHERE order_id = rec.order_id;"},
+                        {"line": 90, "text": "  COMMIT;"},
+                    ],
+                }
+            ],
+        }
+
+        recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
+        recommendation_map = {item["rule_id"]: item for item in recommendations}
+
+        self.assertIn("PLSQL-DYNAMIC-SQL", recommendation_map)
+        self.assertIn("PLSQL-COMMIT-HOT", recommendation_map)
+        self.assertIn("dynamic SQL", recommendation_map["PLSQL-DYNAMIC-SQL"]["message"])
+        self.assertIn("COMMIT", recommendation_map["PLSQL-COMMIT-HOT"]["hint_sql"].upper())
+
 
 class PerfComparatorOracleCaptureTests(unittest.TestCase):
     def _build_config(self, tmpdir, **settings_updates):
@@ -1521,9 +1668,11 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
             (True, "", ""),
             (True, "42\n", ""),
             (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t18\t10\t900000\tFOR i IN 1..500000 LOOP\n", ""),
+            (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t900000\t10\n", ""),
             (True, "", ""),
             (True, "43\n", ""),
             (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t18\t10\t900000\tFOR i IN 1..500000 LOOP\n", ""),
+            (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t900000\t10\n", ""),
         ]
 
         with mock.patch.object(
@@ -2259,6 +2408,73 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn("plsql-map=medium@dba_source_blob_split", html_text)
             self.assertIn("plsql_map=medium@dba_source_blob_split", summary_text)
             self.assertIn("-- plsql-profile-map: medium@dba_source_blob_split", hints_text)
+
+    def test_report_only_mode_surfaces_plsql_profile_diagnosis_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153700.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153700.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "pkg-diag-1",
+                    "sql_text": "BEGIN order_sync_pkg.run_batch; END",
+                    "baseline_avg_elapsed_us": 1000.0,
+                    "baseline_avg_logical_reads": 20.0,
+                },
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                {
+                    "sql_id": "pkg-diag-1",
+                    "sql_text": "BEGIN order_sync_pkg.run_batch; END",
+                    "ob_status": "ok",
+                    "ob_elapsed_us": 3800.0,
+                    "ob_net_time_us": 2100.0,
+                    "ob_plan_type_raw": "3",
+                    "plsql_profile_status": "ok",
+                    "plsql_profile_summary": "ORDER_SYNC_PKG:88:EXECUTE IMMEDIATE v_sql USING 'DONE', rec.order_id;",
+                    "plsql_profile_diagnosis_summary": "ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop",
+                },
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+            self.assertEqual(exit_code, 0)
+            html_path = next(report_dir.glob("perf_report_*.html"))
+            summary_path = next(report_dir.glob("perf_report_*_summary.txt"))
+            hints_path = next(report_dir.glob("perf_hints_*.sql"))
+            html_text = html_path.read_text(encoding="utf-8")
+            summary_text = summary_path.read_text(encoding="utf-8")
+            hints_text = hints_path.read_text(encoding="utf-8")
+            self.assertIn("plsql_diag=ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop", summary_text)
+            self.assertIn("plsql-diag=ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop", html_text)
+            self.assertIn("-- plsql-profile-diagnosis: ORDER_SYNC_PKG:87-90:dynamic_sql_in_loop", hints_text)
 
     def test_report_only_mode_renders_chart_sections(self):
         with tempfile.TemporaryDirectory() as tmpdir:

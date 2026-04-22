@@ -1764,6 +1764,8 @@ def summarize_plsql_profile(row):
     # type: (Dict[str, Any]) -> str
     if row.get("plsql_profile_summary"):
         return str(row.get("plsql_profile_summary"))
+    if row.get("plsql_profile_diagnosis_summary"):
+        return str(row.get("plsql_profile_diagnosis_summary"))
     if row.get("plsql_profile_status") != "ok":
         if row.get("plsql_profile_status"):
             return str(row.get("plsql_profile_status"))
@@ -1799,6 +1801,243 @@ def summarize_plsql_profile_mapping(row):
     if confidence and strategy:
         return "%s@%s" % (confidence, strategy)
     return confidence or strategy or "n/a"
+
+
+def summarize_plsql_profile_diagnosis(row):
+    # type: (Dict[str, Any]) -> str
+    summary = str(row.get("plsql_profile_diagnosis_summary") or "").strip()
+    return summary or "n/a"
+
+
+def _format_profiler_line_range(start_line, end_line):
+    # type: (Any, Any) -> str
+    start_value = _safe_int(start_line)
+    end_value = _safe_int(end_line)
+    if start_value is None and end_value is None:
+        return "?"
+    if end_value is None or start_value == end_value:
+        return str(start_value if start_value is not None else end_value)
+    return "%s-%s" % (start_value, end_value)
+
+
+def _collect_profiler_source_map(lines):
+    # type: (List[Dict[str, Any]]) -> Dict[int, str]
+    source_map = {}
+    for line in lines:
+        line_no = _safe_int(line.get("line"))
+        source_text = _normalize_source_line_text(line.get("source_text"))
+        if line_no is not None and source_text and line_no not in source_map:
+            source_map[line_no] = source_text
+        for context_row in line.get("context_lines") or []:
+            context_line = _safe_int(context_row.get("line"))
+            if context_line is None:
+                continue
+            context_text = _normalize_source_line_text(context_row.get("text"))
+            if context_line not in source_map or not source_map.get(context_line):
+                source_map[context_line] = context_text
+    return source_map
+
+
+def _build_profiler_block_excerpt(source_map, start_line, end_line):
+    # type: (Dict[int, str], int, int) -> str
+    parts = []
+    for line_no in range(int(start_line), int(end_line) + 1):
+        text = str(source_map.get(line_no) or "").strip()
+        if text:
+            parts.append(text)
+    return " | ".join(parts[:4])[:220]
+
+
+def _contains_profiler_pattern(source_text, patterns):
+    # type: (str, Sequence[str]) -> bool
+    upper_text = str(source_text or "").upper()
+    for pattern in patterns:
+        if re.search(pattern, upper_text):
+            return True
+    return False
+
+
+def _diagnose_profiler_block(block):
+    # type: (Dict[str, Any]) -> List[Dict[str, Any]]
+    source_map = block.get("source_map") or {}
+    ordered_lines = [source_map[line_no] for line_no in sorted(source_map.keys())]
+    source_text = "\n".join(str(line or "") for line in ordered_lines)
+    has_loop = _contains_profiler_pattern(source_text, [r"\bFOR\b", r"\bWHILE\b", r"\bLOOP\b"])
+    has_dynamic_sql = _contains_profiler_pattern(source_text, [r"EXECUTE\s+IMMEDIATE", r"DBMS_SQL"])
+    has_dml = _contains_profiler_pattern(
+        source_text,
+        [r"\bINSERT\b", r"\bUPDATE\b", r"\bDELETE\b", r"\bMERGE\b", r"\bSELECT\b.+\bINTO\b"],
+    )
+    has_commit = _contains_profiler_pattern(source_text, [r"\bCOMMIT\b", r"\bROLLBACK\b"])
+    has_cpu_expression = _contains_profiler_pattern(
+        source_text,
+        [r"\bSQRT\b", r"\bSUBSTR\b", r"\bREGEXP_", r"\bTO_CHAR\b", r"\bTO_NUMBER\b", r"\bDBMS_LOB\b"],
+    )
+    diagnoses = []
+    line_range = _format_profiler_line_range(block.get("start_line"), block.get("end_line"))
+    base_payload = {
+        "owner": block.get("owner"),
+        "unit_name": block.get("unit_name"),
+        "unit_type": block.get("unit_type"),
+        "line_range": line_range,
+        "total_time_us": block.get("total_time_us"),
+        "total_occur": block.get("total_occur"),
+        "source_excerpt": block.get("source_excerpt"),
+    }
+
+    if has_loop and has_dynamic_sql:
+        diagnoses.append(
+            dict(
+                base_payload,
+                diagnosis_id="dynamic_sql_in_loop",
+                severity="high",
+                message="Dynamic SQL is executed inside a hot loop.",
+            )
+        )
+    if has_loop and has_commit and float(block.get("total_occur") or 0.0) >= 100.0:
+        diagnoses.append(
+            dict(
+                base_payload,
+                diagnosis_id="frequent_commit_in_loop",
+                severity="high",
+                message="Commit appears inside a high-frequency loop.",
+            )
+        )
+    if has_loop and (has_dml or has_dynamic_sql):
+        diagnoses.append(
+            dict(
+                base_payload,
+                diagnosis_id="row_by_row_sql_in_loop",
+                severity="high",
+                message="Loop body performs SQL row by row instead of batching work.",
+            )
+        )
+        diagnoses.append(
+            dict(
+                base_payload,
+                diagnosis_id="bulk_candidate",
+                severity="medium",
+                message="Hot loop is a candidate for BULK COLLECT, FORALL, or MERGE rewrite.",
+            )
+        )
+    if has_loop and has_cpu_expression and not (has_dml or has_dynamic_sql or has_commit) and float(block.get("total_occur") or 0.0) >= 1000.0:
+        diagnoses.append(
+            dict(
+                base_payload,
+                diagnosis_id="tight_cpu_loop",
+                severity="medium",
+                message="A tight CPU loop dominates profiler time without SQL offload.",
+            )
+        )
+    return diagnoses
+
+
+def analyze_plsql_profile_evidence(top_lines, unit_summary):
+    # type: (List[Dict[str, Any]], List[Dict[str, Any]]) -> Dict[str, Any]
+    normalized_units = [dict(item) for item in (unit_summary or [])]
+    total_profile_time_us = sum(float(item.get("total_time_us") or 0.0) for item in normalized_units)
+    if total_profile_time_us <= 0.0:
+        total_profile_time_us = sum(float(item.get("total_time_us") or 0.0) for item in (top_lines or []))
+    if total_profile_time_us <= 0.0:
+        total_profile_time_us = 1.0
+    for item in normalized_units:
+        if item.get("profile_time_ratio") in (None, ""):
+            item["profile_time_ratio"] = float(item.get("total_time_us") or 0.0) / total_profile_time_us
+    by_unit = {}
+    for line in top_lines or []:
+        line_no = _safe_int(line.get("line"))
+        if line_no is None:
+            continue
+        key = (line.get("owner"), line.get("unit_name"), line.get("unit_type"))
+        by_unit.setdefault(key, []).append(dict(line))
+
+    hot_blocks = []
+    for (owner, unit_name, unit_type), lines in by_unit.items():
+        sorted_lines = sorted(lines, key=lambda item: int(item.get("line") or 0))
+        current_block = []
+        current_last_line = None
+        for line in sorted_lines:
+            line_no = int(line.get("line") or 0)
+            if current_block and current_last_line is not None and line_no > current_last_line + 2:
+                hot_blocks.append(
+                    {
+                        "owner": owner,
+                        "unit_name": unit_name,
+                        "unit_type": unit_type,
+                        "lines": list(current_block),
+                    }
+                )
+                current_block = []
+            current_block.append(line)
+            current_last_line = line_no
+        if current_block:
+            hot_blocks.append(
+                {
+                    "owner": owner,
+                    "unit_name": unit_name,
+                    "unit_type": unit_type,
+                    "lines": list(current_block),
+                }
+            )
+
+    for block in hot_blocks:
+        hot_lines = block.get("lines") or []
+        block_line_numbers = [int(item.get("line") or 0) for item in hot_lines if _safe_int(item.get("line")) is not None]
+        block["start_line"] = min(block_line_numbers) if block_line_numbers else None
+        block["end_line"] = max(block_line_numbers) if block_line_numbers else None
+        block["total_time_us"] = sum(float(item.get("total_time_us") or 0.0) for item in hot_lines)
+        block["total_occur"] = sum(float(item.get("total_occur") or 0.0) for item in hot_lines)
+        block["profile_time_ratio"] = float(block.get("total_time_us") or 0.0) / total_profile_time_us
+        block["source_map"] = _collect_profiler_source_map(hot_lines)
+        block["source_excerpt"] = _build_profiler_block_excerpt(
+            block["source_map"],
+            block.get("start_line") or 0,
+            block.get("end_line") or 0,
+        )
+        diagnoses = _diagnose_profiler_block(block)
+        block["diagnosis_ids"] = [item["diagnosis_id"] for item in diagnoses]
+        block["primary_diagnosis_id"] = diagnoses[0]["diagnosis_id"] if diagnoses else ""
+        block["diagnosis_summary"] = (
+            "%s:%s:%s"
+            % (
+                block.get("unit_name") or "unit",
+                _format_profiler_line_range(block.get("start_line"), block.get("end_line")),
+                diagnoses[0]["diagnosis_id"],
+            )
+            if diagnoses
+            else ""
+        )
+        block["lines"] = hot_lines
+
+    hot_blocks = sorted(
+        hot_blocks,
+        key=lambda item: (
+            -float(item.get("total_time_us") or 0.0),
+            str(item.get("unit_name") or ""),
+            int(item.get("start_line") or 0),
+        ),
+    )
+    diagnoses = []
+    for block in hot_blocks:
+        block_diagnoses = _diagnose_profiler_block(block)
+        diagnoses.extend(block_diagnoses)
+    diagnoses = sorted(
+        diagnoses,
+        key=lambda item: (
+            {"high": 0, "medium": 1, "low": 2}.get(str(item.get("severity") or "low"), 3),
+            -float(item.get("total_time_us") or 0.0),
+        ),
+    )
+    diagnosis_summary = " | ".join(
+        "%s:%s:%s" % (item.get("unit_name") or "unit", item.get("line_range") or "?", item.get("diagnosis_id") or "")
+        for item in diagnoses[:3]
+    )
+    return {
+        "unit_summary": normalized_units,
+        "hot_blocks": hot_blocks,
+        "diagnoses": diagnoses,
+        "diagnosis_summary": diagnosis_summary,
+    }
 
 
 def _sanitize_filename_fragment(value):
@@ -2520,6 +2759,105 @@ def _build_plsql_rpc_hint_sql(row):
     )
 
 
+def _build_plsql_dynamic_sql_hint_sql(row):
+    # type: (Dict[str, Any]) -> str
+    hotspot = _get_profiler_hotspot(row)
+    unit_name = str(hotspot.get("unit_name") if hotspot else "REPLACE_PACKAGE")
+    target_table = _infer_profiler_target_table(hotspot)
+    return "\n".join(
+        [
+            "-- profiler_diagnosis: dynamic SQL executed inside a hot loop",
+            "-- package: %s" % unit_name,
+            "-- Prefer static SQL when object names are fixed; otherwise prepare the statement once per batch.",
+            "DECLARE",
+            "  v_stmt CONSTANT VARCHAR2(32767) := 'UPDATE %s SET <target_col> = :1 WHERE <pk_col> = :2';" % target_table,
+            "BEGIN",
+            "  FORALL i IN INDICES OF v_ids",
+            "    EXECUTE IMMEDIATE v_stmt USING v_values(i), v_ids(i);",
+            "END;",
+            "/",
+        ]
+    )
+
+
+def _build_plsql_commit_hot_hint_sql(row):
+    # type: (Dict[str, Any]) -> str
+    hotspot = _get_profiler_hotspot(row)
+    unit_name = str(hotspot.get("unit_name") if hotspot else "REPLACE_PACKAGE")
+    return "\n".join(
+        [
+            "-- profiler_diagnosis: COMMIT or ROLLBACK appears inside a high-frequency loop",
+            "-- package: %s" % unit_name,
+            "DECLARE",
+            "  v_batch_count PLS_INTEGER := 0;",
+            "BEGIN",
+            "  FOR i IN 1..v_ids.COUNT LOOP",
+            "    -- DML work here",
+            "    v_batch_count := v_batch_count + 1;",
+            "    IF MOD(v_batch_count, 1000) = 0 THEN",
+            "      COMMIT;",
+            "    END IF;",
+            "  END LOOP;",
+            "  COMMIT;",
+            "END;",
+            "/",
+        ]
+    )
+
+
+def _build_plsql_cpu_loop_hint_sql(row):
+    # type: (Dict[str, Any]) -> str
+    hotspot = _get_profiler_hotspot(row)
+    unit_name = str(hotspot.get("unit_name") if hotspot else "REPLACE_PACKAGE")
+    return "\n".join(
+        [
+            "-- profiler_diagnosis: tight CPU loop dominates this package block",
+            "-- package: %s" % unit_name,
+            "-- Replace procedural math/string work with set-based SQL, deterministic helper functions, or cached precomputed values.",
+        ]
+    )
+
+
+def _build_diagnosis_recommendations(row):
+    # type: (Dict[str, Any]) -> List[Dict[str, str]]
+    recommendations = []
+    diagnoses = row.get("plsql_profile_diagnoses") or []
+    diagnosis_ids = {str(item.get("diagnosis_id") or "") for item in diagnoses}
+    if "dynamic_sql_in_loop" in diagnosis_ids:
+        recommendations.append(
+            {
+                "rule_id": "PLSQL-DYNAMIC-SQL",
+                "message": "Profiler shows dynamic SQL inside a hot package loop.",
+                "hint_sql": _build_plsql_dynamic_sql_hint_sql(row),
+            }
+        )
+    if "frequent_commit_in_loop" in diagnosis_ids:
+        recommendations.append(
+            {
+                "rule_id": "PLSQL-COMMIT-HOT",
+                "message": "Profiler shows COMMIT or ROLLBACK inside a high-frequency loop.",
+                "hint_sql": _build_plsql_commit_hot_hint_sql(row),
+            }
+        )
+    if "tight_cpu_loop" in diagnosis_ids:
+        recommendations.append(
+            {
+                "rule_id": "PLSQL-CPU-HOT",
+                "message": "Profiler shows a tight CPU loop dominating package runtime.",
+                "hint_sql": _build_plsql_cpu_loop_hint_sql(row),
+            }
+        )
+    if "bulk_candidate" in diagnosis_ids:
+        recommendations.append(
+            {
+                "rule_id": "PLSQL-BULK",
+                "message": "Profiler shows a loop that should be rewritten with BULK COLLECT, FORALL, or MERGE.",
+                "hint_sql": _build_plsql_rpc_hint_sql(row),
+            }
+        )
+    return recommendations
+
+
 def build_recommendations(row, slowdown_threshold):
     # type: (Dict[str, Any], float) -> List[Dict[str, str]]
     recommendations = []
@@ -2670,6 +3008,7 @@ def build_recommendations(row, slowdown_threshold):
                 "hint_sql": "-- Review the reported package line and replace row-by-row loops with set-based or FORALL logic",
             }
         )
+    recommendations.extend(_build_diagnosis_recommendations(row))
     if row.get("verification_status") == "mismatch":
         recommendations.append(
             {
@@ -4430,6 +4769,53 @@ def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
     return hot_lines
 
 
+def _fetch_plsql_profile_unit_summary(config, runid):
+    # type: (AppConfig, int) -> List[Dict[str, Any]]
+    query = """
+        SELECT
+          u.UNIT_OWNER,
+          u.UNIT_NAME,
+          u.UNIT_TYPE,
+          SUM(d.TOTAL_TIME),
+          SUM(d.TOTAL_OCCUR)
+        FROM PLSQL_PROFILER_UNITS u
+        JOIN PLSQL_PROFILER_DATA d
+          ON d.RUNID = u.RUNID
+         AND d.UNIT_NUMBER = u.UNIT_NUMBER
+        WHERE u.RUNID = {runid}
+        GROUP BY u.UNIT_OWNER, u.UNIT_NAME, u.UNIT_TYPE
+        ORDER BY SUM(d.TOTAL_TIME) DESC, SUM(d.TOTAL_OCCUR) DESC
+    """.format(runid=int(runid))
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return []
+    rows = []
+    for raw_line in stdout.splitlines():
+        fields = raw_line.split("\t")
+        if len(fields) < 5:
+            continue
+        rows.append(
+            {
+                "owner": fields[0],
+                "unit_name": fields[1],
+                "unit_type": fields[2],
+                "total_time_us": _safe_float(fields[3]),
+                "total_occur": _safe_float(fields[4]),
+            }
+        )
+    total_time_us = sum(float(item.get("total_time_us") or 0.0) for item in rows) or 1.0
+    for item in rows:
+        item["profile_time_ratio"] = float(item.get("total_time_us") or 0.0) / total_time_us
+    return rows
+
+
 def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
     # type: (AppConfig, Dict[str, Any], str, int) -> Dict[str, Any]
     init_ok, init_reason = ensure_plsql_profiler_initialized(config)
@@ -4478,6 +4864,8 @@ def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
         int(config.settings.get("plsql_profile_top_n", DEFAULT_PLSQL_PROFILE_TOP_N)),
         int(config.settings.get("plsql_profile_source_context", DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT)),
     )
+    unit_summary = _fetch_plsql_profile_unit_summary(config, runid)
+    analysis = analyze_plsql_profile_evidence(top_lines, unit_summary)
     artifact_path = build_artifact_path(
         "plsql_profile",
         run_group,
@@ -4492,6 +4880,10 @@ def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
             "runid": runid,
             "profiler_comment": profiler_comment,
             "top_lines": top_lines,
+            "unit_summary": analysis.get("unit_summary") or [],
+            "hot_blocks": analysis.get("hot_blocks") or [],
+            "diagnoses": analysis.get("diagnoses") or [],
+            "diagnosis_summary": analysis.get("diagnosis_summary") or "",
             "source_mapping_summary": summarize_plsql_profile_mapping(
                 {"plsql_profile_status": "ok", "plsql_profile_top_lines": top_lines}
             ),
@@ -4503,6 +4895,10 @@ def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
         "error": "",
         "runid": runid,
         "top_lines": top_lines,
+        "unit_summary": analysis.get("unit_summary") or [],
+        "hot_blocks": analysis.get("hot_blocks") or [],
+        "diagnoses": analysis.get("diagnoses") or [],
+        "diagnosis_summary": analysis.get("diagnosis_summary") or "",
         "artifact_path": str(artifact_path),
         "mapping_summary": summarize_plsql_profile_mapping(
             {"plsql_profile_status": "ok", "plsql_profile_top_lines": top_lines}
@@ -4638,10 +5034,15 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
         merged["plsql_profile_runid"] = plsql_profile.get("runid")
         merged["plsql_profile_artifact_path"] = plsql_profile.get("artifact_path")
         merged["plsql_profile_top_lines"] = plsql_profile.get("top_lines") or []
+        merged["plsql_profile_unit_summary"] = plsql_profile.get("unit_summary") or []
+        merged["plsql_profile_hot_blocks"] = plsql_profile.get("hot_blocks") or []
+        merged["plsql_profile_diagnoses"] = plsql_profile.get("diagnoses") or []
+        merged["plsql_profile_diagnosis_summary"] = plsql_profile.get("diagnosis_summary") or ""
         merged["plsql_profile_summary"] = summarize_plsql_profile(
             {
                 "plsql_profile_status": plsql_profile.get("status"),
                 "plsql_profile_top_lines": plsql_profile.get("top_lines") or [],
+                "plsql_profile_diagnosis_summary": plsql_profile.get("diagnosis_summary") or "",
             }
         )
         merged["plsql_profile_mapping_summary"] = plsql_profile.get(
@@ -4881,6 +5282,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
             base["plsql_profile_summary"] = summarize_plsql_profile(base)
         if "plsql_profile_mapping_summary" not in base:
             base["plsql_profile_mapping_summary"] = summarize_plsql_profile_mapping(base)
+        if "plsql_profile_diagnosis_summary" not in base:
+            base["plsql_profile_diagnosis_summary"] = summarize_plsql_profile_diagnosis(base)
         base["recommendations"] = build_recommendations(
             base,
             slowdown_threshold=float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD)),
@@ -4930,6 +5333,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         plan_risk_summary = summarize_plan_diff_signals(row)
         plsql_profile_summary = summarize_plsql_profile(row)
         plsql_profile_mapping_summary = summarize_plsql_profile_mapping(row)
+        plsql_profile_diagnosis_summary = summarize_plsql_profile_diagnosis(row)
         external_summary = summarize_external_diagnostics(row)
         summary_line = (
             "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s plan_risk=%s plsql=%s plsql_map=%s"
@@ -4947,6 +5351,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 plsql_profile_mapping_summary,
             )
         )
+        if plsql_profile_diagnosis_summary != "n/a":
+            summary_line = "%s plsql_diag=%s" % (summary_line, plsql_profile_diagnosis_summary)
         if external_summary != "n/a":
             summary_line = "%s external=%s" % (summary_line, external_summary)
         summary_lines.append(summary_line)
@@ -4959,6 +5365,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         plan_risk_summary = summarize_plan_diff_signals(row)
         plsql_profile_summary = summarize_plsql_profile(row)
         plsql_profile_mapping_summary = summarize_plsql_profile_mapping(row)
+        plsql_profile_diagnosis_summary = summarize_plsql_profile_diagnosis(row)
         external_summary = summarize_external_diagnostics(row)
         evidence_parts = [
             "verification=%s" % verification_status,
@@ -4968,6 +5375,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         ]
         if plsql_profile_mapping_summary != "n/a":
             evidence_parts.append("plsql-map=%s" % plsql_profile_mapping_summary)
+        if plsql_profile_diagnosis_summary != "n/a":
+            evidence_parts.append("plsql-diag=%s" % plsql_profile_diagnosis_summary)
         if external_summary != "n/a":
             evidence_parts.append(external_summary)
         html_rows.append(
@@ -5032,6 +5441,10 @@ svg text { font-family: Arial, sans-serif; fill: #1a202c; }
             hints_lines.append(
                 "-- plsql-profile-map: %s" % summarize_plsql_profile_mapping(row)
             )
+            if summarize_plsql_profile_diagnosis(row) != "n/a":
+                hints_lines.append(
+                    "-- plsql-profile-diagnosis: %s" % summarize_plsql_profile_diagnosis(row)
+                )
         external_summary = summarize_external_diagnostics(row)
         if external_summary != "n/a":
             hints_lines.append("-- external-diagnostics: %s" % external_summary)
