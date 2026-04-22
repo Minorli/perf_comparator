@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shlex
+import ssl
 import stat
 import subprocess
 import sys
@@ -21,10 +22,11 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -488,6 +490,14 @@ def load_config(config_path, execution_mode=None):
             settings_section, "slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD
         ),
         "wcr_path": (settings_section.get("wcr_path") or "").strip(),
+        "ocp_base_url": (settings_section.get("ocp_base_url") or "").strip(),
+        "ocp_authorization_env": (settings_section.get("ocp_authorization_env") or "").strip(),
+        "ocp_cluster_id": (settings_section.get("ocp_cluster_id") or "").strip(),
+        "ocp_tenant_id": (settings_section.get("ocp_tenant_id") or "").strip(),
+        "ocp_verify_tls": str(settings_section.get("ocp_verify_tls") or "true").strip().lower()
+        in ("1", "true", "yes", "on"),
+        "ocp_window_minutes": _get_optional_int(settings_section, "ocp_window_minutes", 15),
+        "ocp_query_limit": _get_optional_int(settings_section, "ocp_query_limit", 20),
         "ocp_ash_url_template": (settings_section.get("ocp_ash_url_template") or "").strip(),
         "ocp_qpm_url_template": (settings_section.get("ocp_qpm_url_template") or "").strip(),
         "ocp_auth_token_env": (settings_section.get("ocp_auth_token_env") or "").strip(),
@@ -1757,19 +1767,179 @@ def _build_external_context(row, run_id):
     }
 
 
+def _build_ocp_headers(config):
+    # type: (AppConfig) -> Dict[str, str]
+    headers = {}
+    authorization_env = str(config.settings.get("ocp_authorization_env") or "").strip()
+    if authorization_env and os.environ.get(authorization_env):
+        headers["Authorization"] = os.environ.get(authorization_env) or ""
+        return headers
+    token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
+    token_value = os.environ.get(token_env) if token_env else ""
+    if token_value:
+        headers["Authorization"] = "Bearer %s" % token_value
+    return headers
+
+
+def _open_ocp_request(config, request, timeout_seconds):
+    # type: (AppConfig, Any, int) -> Any
+    if config.settings.get("ocp_verify_tls", True):
+        return urllib.request.urlopen(request, timeout=timeout_seconds)
+    context = ssl._create_unverified_context()  # type: ignore[attr-defined]
+    return urllib.request.urlopen(request, timeout=timeout_seconds, context=context)
+
+
+def _parse_iso_datetime(value):
+    # type: (Any) -> Optional[datetime]
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _extract_ocp_contents(payload):
+    # type: (Any) -> List[Dict[str, Any]]
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            contents = data.get("contents")
+            if isinstance(contents, list):
+                return [item for item in contents if isinstance(item, dict)]
+        if isinstance(payload.get("contents"), list):
+            return [item for item in payload.get("contents") if isinstance(item, dict)]
+    return []
+
+
+def _first_non_empty(mapping, keys):
+    # type: (Dict[str, Any], Sequence[str]) -> Any
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _build_ocp_native_base(config):
+    # type: (AppConfig) -> str
+    return str(config.settings.get("ocp_base_url") or "").rstrip("/")
+
+
+def _build_ocp_native_sql_list_url(config, path_name, row):
+    # type: (AppConfig, str, Dict[str, Any]) -> str
+    replayed_at = _parse_iso_datetime(row.get("replayed_at") or row.get("captured_at")) or datetime.now(timezone.utc)
+    if replayed_at.tzinfo is None:
+        replayed_at = replayed_at.replace(tzinfo=timezone.utc)
+    window_minutes = max(1, int(config.settings.get("ocp_window_minutes", 15)))
+    start_time = replayed_at - timedelta(minutes=window_minutes)
+    end_time = replayed_at + timedelta(minutes=window_minutes)
+    query = {
+        "startTime": start_time.isoformat(),
+        "endTime": end_time.isoformat(),
+        "sqlText": build_sql_preview(row.get("sql_text"), limit=120),
+        "page": 1,
+        "size": max(1, int(config.settings.get("ocp_query_limit", 20))),
+    }
+    return "%s/api/v2/ob/clusters/%s/tenants/%s/%s?%s" % (
+        _build_ocp_native_base(config),
+        config.settings.get("ocp_cluster_id"),
+        config.settings.get("ocp_tenant_id"),
+        path_name,
+        urllib.parse.urlencode(query),
+    )
+
+
+def _build_ocp_native_sql_text_url(config, ocp_sql_id):
+    # type: (AppConfig, str) -> str
+    return "%s/api/v2/ob/clusters/%s/tenants/%s/sql/%s/text" % (
+        _build_ocp_native_base(config),
+        config.settings.get("ocp_cluster_id"),
+        config.settings.get("ocp_tenant_id"),
+        urllib.parse.quote(str(ocp_sql_id or ""), safe=""),
+    )
+
+
+def _collect_ocp_native_row_diagnostics(config, row, run_id):
+    # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
+    context = _build_external_context(row, run_id)
+    report_dir = config.settings["report_dir"]
+    timeout_seconds = int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT))
+    headers = _build_ocp_headers(config)
+    payload_manifest = {}  # type: Dict[str, Any]
+    candidate = None  # type: Optional[Dict[str, Any]]
+    candidate_source = ""
+    summaries = []
+    for provider_name, path_name in (("top_sql", "topSql"), ("slow_sql", "slowSql")):
+        url = _build_ocp_native_sql_list_url(config, path_name, row)
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            response = _open_ocp_request(config, request, timeout_seconds)
+            body = response.read().decode("utf-8", errors="ignore")
+        except Exception as exc:
+            return {"status": "error", "summary": str(exc), "artifact_path": ""}
+        artifact_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], provider_name, ".json")
+        write_text(artifact_path, body)
+        payload = {}
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {}
+        contents = _extract_ocp_contents(payload)
+        payload_manifest[provider_name] = {
+            "url": url,
+            "artifact_path": str(artifact_path),
+            "match_count": len(contents),
+        }
+        summaries.append("%s=%s" % (provider_name, len(contents)))
+        if contents and candidate is None:
+            candidate = contents[0]
+            candidate_source = provider_name
+    if candidate is None:
+        manifest_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "ocp_native", ".json")
+        write_json(manifest_path, payload_manifest)
+        return {"status": "no-match", "summary": "; ".join(summaries), "artifact_path": str(manifest_path)}
+    ocp_sql_id = _first_non_empty(candidate, ("sqlId", "sql_id", "id"))
+    if ocp_sql_id:
+        text_url = _build_ocp_native_sql_text_url(config, str(ocp_sql_id))
+        request = urllib.request.Request(text_url, headers=headers)
+        try:
+            response = _open_ocp_request(config, request, timeout_seconds)
+            body = response.read().decode("utf-8", errors="ignore")
+        except Exception as exc:
+            return {"status": "error", "summary": str(exc), "artifact_path": ""}
+        text_artifact_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "sql_text", ".json")
+        write_text(text_artifact_path, body)
+        payload_manifest["sql_text"] = {"url": text_url, "artifact_path": str(text_artifact_path)}
+    manifest_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], "ocp_native", ".json")
+    write_json(
+        manifest_path,
+        {
+            "provider": "native_ocp",
+            "selected_source": candidate_source,
+            "selected_sql_id": ocp_sql_id,
+            "selected_candidate": candidate,
+            "payloads": payload_manifest,
+        },
+    )
+    summary = "%s sqlId=%s hits=%s" % (candidate_source or "top_sql", ocp_sql_id or "n/a", "; ".join(summaries))
+    return {"status": "ok", "summary": summary, "artifact_path": str(manifest_path)}
+
+
 def _collect_ocp_row_diagnostics(config, row, run_id):
     # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
     capability = _probe_ocp_capability(config)
     if capability.get("status") != "ready":
         return {"status": str(capability.get("status") or "unconfigured"), "summary": str(capability.get("error") or ""), "artifact_path": ""}
+    if capability.get("mode") == "native":
+        return _collect_ocp_native_row_diagnostics(config, row, run_id)
     context = _build_external_context(row, run_id)
     report_dir = config.settings["report_dir"]
     timeout_seconds = int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT))
-    token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
-    token_value = os.environ.get(token_env) if token_env else ""
-    headers = {}
-    if token_value:
-        headers["Authorization"] = "Bearer %s" % token_value
+    headers = _build_ocp_headers(config)
     payload = {}
     summaries = []
     for provider_name, template_key in (("ash", "ocp_ash_url_template"), ("qpm", "ocp_qpm_url_template")):
@@ -1779,7 +1949,7 @@ def _collect_ocp_row_diagnostics(config, row, run_id):
         url = _format_external_template(template, context)
         request = urllib.request.Request(url, headers=headers)
         try:
-            response = urllib.request.urlopen(request, timeout=timeout_seconds)
+            response = _open_ocp_request(config, request, timeout_seconds)
             body = response.read().decode("utf-8", errors="ignore")
         except Exception as exc:
             return {"status": "error", "summary": str(exc), "artifact_path": ""}
@@ -2453,6 +2623,10 @@ def validate_runtime_paths(config):
             result.warnings.append(
                 "obdiag executable exists but is not executable: %s" % str(obdiag_path)
             )
+
+    authorization_env = str(config.settings.get("ocp_authorization_env") or "").strip()
+    if authorization_env and not os.environ.get(authorization_env):
+        result.warnings.append("OCP authorization env is not set: %s" % authorization_env)
 
     token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
     has_ocp_templates = bool(
@@ -3551,6 +3725,43 @@ def _probe_plsql_profiler_capability(config):
 
 def _probe_ocp_capability(config):
     # type: (AppConfig) -> Dict[str, Any]
+    base_url = str(config.settings.get("ocp_base_url") or "").strip()
+    auth_env = str(config.settings.get("ocp_authorization_env") or "").strip()
+    cluster_id = str(config.settings.get("ocp_cluster_id") or "").strip()
+    tenant_id = str(config.settings.get("ocp_tenant_id") or "").strip()
+    if base_url or auth_env or cluster_id or tenant_id:
+        missing = []
+        if not base_url:
+            missing.append("ocp_base_url")
+        if not auth_env:
+            missing.append("ocp_authorization_env")
+        if not cluster_id:
+            missing.append("ocp_cluster_id")
+        if not tenant_id:
+            missing.append("ocp_tenant_id")
+        if missing:
+            return {
+                "available": False,
+                "status": "misconfigured",
+                "mode": "native",
+                "error": "missing native OCP settings: %s" % ", ".join(missing),
+            }
+        if not os.environ.get(auth_env):
+            return {
+                "available": False,
+                "status": "misconfigured",
+                "mode": "native",
+                "error": "missing auth header env: %s" % auth_env,
+            }
+        return {
+            "available": True,
+            "status": "ready",
+            "mode": "native",
+            "error": "",
+            "base_url": base_url,
+            "cluster_id": cluster_id,
+            "tenant_id": tenant_id,
+        }
     ash_template = str(config.settings.get("ocp_ash_url_template") or "").strip()
     qpm_template = str(config.settings.get("ocp_qpm_url_template") or "").strip()
     if not ash_template and not qpm_template:
@@ -3565,6 +3776,7 @@ def _probe_ocp_capability(config):
     return {
         "available": True,
         "status": "ready",
+        "mode": "template",
         "error": "",
         "has_ash": bool(ash_template),
         "has_qpm": bool(qpm_template),
@@ -3584,7 +3796,11 @@ def _probe_obdiag_capability(config):
 def has_external_diagnostics_config(config):
     # type: (AppConfig) -> bool
     return bool(
-        str(config.settings.get("ocp_ash_url_template") or "").strip()
+        str(config.settings.get("ocp_base_url") or "").strip()
+        or str(config.settings.get("ocp_authorization_env") or "").strip()
+        or str(config.settings.get("ocp_cluster_id") or "").strip()
+        or str(config.settings.get("ocp_tenant_id") or "").strip()
+        or str(config.settings.get("ocp_ash_url_template") or "").strip()
         or str(config.settings.get("ocp_qpm_url_template") or "").strip()
         or str(config.settings.get("obdiag_executable") or "").strip()
     )

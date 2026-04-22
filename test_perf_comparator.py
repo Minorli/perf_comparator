@@ -290,6 +290,49 @@ class PerfComparatorConfigTests(unittest.TestCase):
             self.assertEqual(cfg.settings["obdiag_executable"], "/usr/local/bin/obdiag")
             self.assertEqual(cfg.settings["obdiag_timeout"], 45)
 
+    def test_load_config_parses_native_ocp_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    ocp_base_url = https://ocp.tidba.com:3600
+                    ocp_authorization_env = PERF_OCP_AUTH
+                    ocp_cluster_id = 8
+                    ocp_tenant_id = 19
+                    ocp_verify_tls = false
+                    ocp_window_minutes = 30
+                    ocp_query_limit = 10
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(str(config_path))
+
+            self.assertEqual(cfg.settings["ocp_base_url"], "https://ocp.tidba.com:3600")
+            self.assertEqual(cfg.settings["ocp_authorization_env"], "PERF_OCP_AUTH")
+            self.assertEqual(cfg.settings["ocp_cluster_id"], "8")
+            self.assertEqual(cfg.settings["ocp_tenant_id"], "19")
+            self.assertEqual(cfg.settings["ocp_verify_tls"], False)
+            self.assertEqual(cfg.settings["ocp_window_minutes"], 30)
+            self.assertEqual(cfg.settings["ocp_query_limit"], 10)
+
 
 class PerfComparatorUtilityTests(unittest.TestCase):
     def test_parse_oracle_dsn(self):
@@ -1077,6 +1120,50 @@ class PerfComparatorObclientTests(unittest.TestCase):
         self.assertEqual(result["ocp"]["status"], "ready")
         self.assertEqual(result["obdiag"]["status"], "ready")
 
+    def test_probe_replay_capabilities_surfaces_native_ocp_mode(self):
+        cfg = perf_comparator.AppConfig(
+            oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+            oceanbase_source={},
+            oceanbase_target={
+                "executable": "/bin/echo",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@test#obcluster",
+                "password": "secret",
+            },
+            settings={
+                "source_schemas": ["APP"],
+                "obclient_timeout": 5,
+                "ob_session_query_timeout_us": 0,
+                "ocp_base_url": "https://ocp.tidba.com:3600",
+                "ocp_authorization_env": "PERF_OCP_AUTH",
+                "ocp_cluster_id": "8",
+                "ocp_tenant_id": "19",
+                "ocp_verify_tls": False,
+                "ocp_window_minutes": 30,
+                "ocp_query_limit": 10,
+            },
+            config_path="config.ini",
+        )
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            side_effect=[(True, "1\n", ""), (True, "ON\n", "")],
+        ), mock.patch.dict(os.environ, {"PERF_OCP_AUTH": "Basic xxx"}, clear=False), mock.patch.object(
+            perf_comparator,
+            "_probe_plsql_profiler_capability",
+            return_value={"available": True, "status": "ready"},
+        ), mock.patch.object(
+            perf_comparator.Path,
+            "exists",
+            return_value=True,
+        ):
+            result = perf_comparator.probe_replay_capabilities(cfg)
+
+        self.assertEqual(result["ocp"]["status"], "ready")
+        self.assertEqual(result["ocp"]["mode"], "native")
+
 
 class PerfComparatorReplayEvidenceTests(unittest.TestCase):
     def _build_config(self, verify_results=False, plsql_profile=False):
@@ -1317,6 +1404,81 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertIn("init failed", result["error"])
         self.assertEqual(obclient_mock.call_count, 1)
+
+    def test_collect_external_row_diagnostics_uses_native_ocp_sql_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._build_config()
+            config.settings.update(
+                {
+                    "report_dir": tmpdir,
+                    "ocp_base_url": "https://ocp.tidba.com:3600",
+                    "ocp_authorization_env": "PERF_OCP_AUTH",
+                    "ocp_cluster_id": "8",
+                    "ocp_tenant_id": "19",
+                    "ocp_verify_tls": False,
+                    "ocp_window_minutes": 30,
+                    "ocp_query_limit": 10,
+                }
+            )
+            row = {
+                "sql_id": "sql-1",
+                "sql_text": "SELECT * FROM orders WHERE status = 'ACTIVE'",
+                "replayed_at": "2026-04-22T10:00:00Z",
+                "ob_status": "ok",
+                "ob_elapsed_us": 3000.0,
+            }
+
+            requested_urls = []
+
+            class _FakeResponse(object):
+                def __init__(self, payload):
+                    self.payload = payload
+
+                def read(self):
+                    return self.payload.encode("utf-8")
+
+            def _urlopen(request, timeout=None, context=None):
+                url = request.full_url
+                requested_urls.append(url)
+                if "topSql" in url:
+                    return _FakeResponse(
+                        json.dumps(
+                            {
+                                "data": {
+                                    "contents": [
+                                        {
+                                            "sqlId": "A1B2C3",
+                                            "avgElapsedTime": 1234,
+                                            "executions": 8,
+                                            "sqlText": "SELECT * FROM orders WHERE status = 'ACTIVE'",
+                                        }
+                                    ]
+                                }
+                            }
+                        )
+                    )
+                if "slowSql" in url:
+                    return _FakeResponse(json.dumps({"data": {"contents": []}}))
+                if "/sql/A1B2C3/text" in url:
+                    return _FakeResponse(
+                        json.dumps(
+                            {"data": {"sqlText": "SELECT * FROM orders WHERE status = 'ACTIVE'"}}
+                        )
+                    )
+                raise AssertionError("unexpected url: %s" % url)
+
+            with mock.patch.dict(os.environ, {"PERF_OCP_AUTH": "Basic xxx"}, clear=False), mock.patch.object(
+                perf_comparator.urllib.request,
+                "urlopen",
+                side_effect=_urlopen,
+            ):
+                result = perf_comparator.collect_external_row_diagnostics(config, row, "20260422_200100")
+
+            self.assertEqual(result["ocp"]["status"], "ok")
+            self.assertIn("A1B2C3", result["ocp"]["summary"])
+            self.assertTrue(any("/api/v2/ob/clusters/8/tenants/19/topSql" in url for url in requested_urls))
+            self.assertTrue(any("/api/v2/ob/clusters/8/tenants/19/slowSql" in url for url in requested_urls))
+            self.assertTrue(any("/api/v2/ob/clusters/8/tenants/19/sql/A1B2C3/text" in url for url in requested_urls))
 
 
 class PerfComparatorRealDbValidationTests(unittest.TestCase):

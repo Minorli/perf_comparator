@@ -42,6 +42,13 @@ timeout_factor = 3.0
 slowdown_threshold = 0.8
 wcr_path =
 plsql_profile = false
+ocp_base_url =
+ocp_authorization_env =
+ocp_cluster_id =
+ocp_tenant_id =
+ocp_verify_tls = true
+ocp_window_minutes = 15
+ocp_query_limit = 20
 ocp_ash_url_template =
 ocp_qpm_url_template =
 ocp_auth_token_env =
@@ -57,6 +64,8 @@ obdiag_timeout = 120
 # - Set [SETTINGS].wcr_path or pass --wcr-path when replaying from a WCR export file.
 # - Set plsql_profile=true to collect DBMS_PROFILER evidence; the runtime will lazily
 #   initialize profiler objects with DBMS_PROFILER.OB_INIT_OBJECTS(FALSE).
+# - Native OCP mode uses ocp_base_url + ocp_authorization_env + ocp_cluster_id +
+#   ocp_tenant_id, and can disable certificate verification with ocp_verify_tls=false.
 # - OCP integration is optional and driven by URL templates plus an auth token env var.
 # - obdiag integration is optional; configure the executable and any required extra args.
 # - source-report mode may omit [ORACLE_SOURCE] and [OCEANBASE_TARGET].

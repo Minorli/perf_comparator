@@ -119,6 +119,14 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 
 可选外部诊断：
 
+- native OCP：
+  - `ocp_base_url`
+  - `ocp_authorization_env`
+  - `ocp_cluster_id`
+  - `ocp_tenant_id`
+  - `ocp_verify_tls`
+  - `ocp_window_minutes`
+  - `ocp_query_limit`
 - `ocp_ash_url_template`
 - `ocp_qpm_url_template`
 - `ocp_auth_token_env`
@@ -129,7 +137,10 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 9
 
 说明：
 
-- OCP 集成通过 URL template 实现，不绑定特定 OCP SDK
+- 如果你使用的是标准 OCP `api/v2`，优先用 native OCP 配置，不需要手工拼 SQL endpoint
+- `ocp_authorization_env` 里放完整的 `Authorization` header 值，例如 `Basic ...` 或 `Bearer ...`
+- 如果当前 OCP 只能通过 `curl -k` 访问，就把 `ocp_verify_tls = false`
+- OCP 集成优先走 native `api/v2` SQL endpoints，特殊环境仍可回退到 URL template 模式
 - obdiag 是可选能力，失败只会记到报告，不会阻塞主流程
 
 ## 产物
