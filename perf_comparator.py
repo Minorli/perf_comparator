@@ -48,8 +48,12 @@ DEFAULT_OBCLIENT_TIMEOUT = 120
 DEFAULT_OB_SESSION_QUERY_TIMEOUT_US = 3600000000
 
 SECTION_ORACLE_SOURCE = "ORACLE_SOURCE"
+SECTION_OCEANBASE_SOURCE = "OCEANBASE_SOURCE"
 SECTION_OCEANBASE_TARGET = "OCEANBASE_TARGET"
 SECTION_SETTINGS = "SETTINGS"
+
+SOURCE_DB_MODE_ORACLE = "oracle"
+SOURCE_DB_MODE_OCEANBASE = "oceanbase"
 
 ARTIFACT_SPECS = {
     "workload": ("workload", ".jsonl"),
@@ -75,6 +79,7 @@ class ConfigError(Exception):
 @dataclass
 class AppConfig:
     oracle_source: Dict[str, str]
+    oceanbase_source: Dict[str, str]
     oceanbase_target: Dict[str, str]
     settings: Dict[str, Any]
     config_path: str
@@ -215,6 +220,46 @@ class SQLAuditCollector(object):
         return sorted(candidates, key=lambda item: item.get("request_id") or 0)[-1]
 
 
+class ReplayBackend(object):
+    """Backend abstraction for replay execution."""
+
+    name = "base"
+
+    def execute(self, config, rendered_sql, timeout_seconds):
+        # type: (AppConfig, str, int) -> Tuple[bool, str, str]
+        raise NotImplementedError
+
+    def explain(self, config, rendered_sql):
+        # type: (AppConfig, str) -> Tuple[bool, str, str]
+        raise NotImplementedError
+
+
+class ObclientReplayBackend(ReplayBackend):
+    name = "obclient"
+
+    def execute(self, config, rendered_sql, timeout_seconds):
+        # type: (AppConfig, str, int) -> Tuple[bool, str, str]
+        return obclient_run_sql(
+            config.oceanbase_target,
+            rendered_sql,
+            timeout=timeout_seconds,
+            session_query_timeout_us=config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
+
+    def explain(self, config, rendered_sql):
+        # type: (AppConfig, str) -> Tuple[bool, str, str]
+        return obclient_run_sql(
+            config.oceanbase_target,
+            "EXPLAIN EXTENDED " + rendered_sql,
+            timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+            session_query_timeout_us=config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
+
+
 def configure_logging(level_name):
     # type: (str) -> None
     level = getattr(logging, str(level_name or "INFO").strip().upper(), logging.INFO)
@@ -246,6 +291,18 @@ def _get_required_value(section, section_name, key):
     if not value:
         raise ConfigError("[%s] missing required key: %s" % (section_name, key))
     return value
+
+
+def _load_ob_section(parser, section_name):
+    # type: (configparser.ConfigParser, str) -> Dict[str, str]
+    section = _get_required_section(parser, section_name)
+    return {
+        "executable": _get_required_value(section, section_name, "executable"),
+        "host": _get_required_value(section, section_name, "host"),
+        "port": _get_required_value(section, section_name, "port"),
+        "user_string": _get_required_value(section, section_name, "user_string"),
+        "password": _get_required_value(section, section_name, "password"),
+    }
 
 
 def _get_optional_int(section, key, default_value):
@@ -280,27 +337,20 @@ def load_config(config_path):
         raise ConfigError("Unable to read config file: %s" % config_path)
 
     oracle_section = _get_required_section(parser, SECTION_ORACLE_SOURCE)
-    ob_target_section = _get_required_section(parser, SECTION_OCEANBASE_TARGET)
     settings_section = _get_required_section(parser, SECTION_SETTINGS)
+    source_db_mode = (settings_section.get("source_db_mode") or SOURCE_DB_MODE_ORACLE).strip().lower()
+    if source_db_mode not in (SOURCE_DB_MODE_ORACLE, SOURCE_DB_MODE_OCEANBASE):
+        raise ConfigError("[SETTINGS] source_db_mode must be oracle or oceanbase")
 
     oracle_source = {
         "user": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "user"),
         "password": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "password"),
         "dsn": _get_required_value(oracle_section, SECTION_ORACLE_SOURCE, "dsn"),
     }
-    oceanbase_target = {
-        "executable": _get_required_value(
-            ob_target_section, SECTION_OCEANBASE_TARGET, "executable"
-        ),
-        "host": _get_required_value(ob_target_section, SECTION_OCEANBASE_TARGET, "host"),
-        "port": _get_required_value(ob_target_section, SECTION_OCEANBASE_TARGET, "port"),
-        "user_string": _get_required_value(
-            ob_target_section, SECTION_OCEANBASE_TARGET, "user_string"
-        ),
-        "password": _get_required_value(
-            ob_target_section, SECTION_OCEANBASE_TARGET, "password"
-        ),
-    }
+    oceanbase_source = {}
+    if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+        oceanbase_source = _load_ob_section(parser, SECTION_OCEANBASE_SOURCE)
+    oceanbase_target = _load_ob_section(parser, SECTION_OCEANBASE_TARGET)
 
     source_schemas = normalize_schema_list(settings_section.get("source_schemas", ""))
     if not source_schemas:
@@ -308,6 +358,7 @@ def load_config(config_path):
 
     settings = {
         "source_schemas": source_schemas,
+        "source_db_mode": source_db_mode,
         "workloads_dir": (settings_section.get("workloads_dir") or DEFAULT_WORKLOADS_DIR).strip()
         or DEFAULT_WORKLOADS_DIR,
         "report_dir": (settings_section.get("report_dir") or DEFAULT_REPORT_DIR).strip()
@@ -320,6 +371,7 @@ def load_config(config_path):
         "audit_poll_ms": _get_optional_int(
             settings_section, "audit_poll_ms", DEFAULT_AUDIT_POLL_MS
         ),
+        "duration": _get_optional_int(settings_section, "duration", 0),
         "obclient_timeout": _get_optional_int(
             settings_section, "obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT
         ),
@@ -338,6 +390,7 @@ def load_config(config_path):
 
     return AppConfig(
         oracle_source=oracle_source,
+        oceanbase_source=oceanbase_source,
         oceanbase_target=oceanbase_target,
         settings=settings,
         config_path=str(config_path),
@@ -505,6 +558,50 @@ def split_sql_text(sql_text):
     return statements
 
 
+def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
+    # type: (str, str, Optional[str]) -> List[Dict[str, Any]]
+    rows = []
+    stamped_at = captured_at or utc_now_iso()
+    for line in (stdout_text or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 15:
+            continue
+        sql_id = fields[2] or compute_sql_id(fields[14])
+        sql_text = fields[14]
+        rows.append(
+            {
+                "sql_id": sql_id,
+                "sql_text": sql_text,
+                "sql_text_normalized": normalize_sql_text(sql_text),
+                "bind_vars": {},
+                "schema": default_schema,
+                "source": "ob_sql_audit",
+                "captured_at": stamped_at,
+                "baseline_source_mode": SOURCE_DB_MODE_OCEANBASE,
+                "baseline_avg_elapsed_us": _safe_float(fields[3]),
+                "baseline_avg_logical_reads": _safe_float(fields[12]),
+                "oracle_executions": 1,
+                "oracle_avg_elapsed_us": _safe_float(fields[3]),
+                "oracle_avg_cpu_us": None,
+                "oracle_avg_logical_reads": _safe_float(fields[12]),
+                "oracle_avg_physical_reads": _safe_float(fields[13]),
+                "oracle_plan_hash": fields[9] or None,
+                "oracle_plan_rows": [],
+                "source_ob_request_id": fields[0],
+                "source_ob_trace_id": fields[1],
+                "source_ob_queue_time_us": _safe_float(fields[4]),
+                "source_ob_get_plan_time_us": _safe_float(fields[5]),
+                "source_ob_execute_time_us": _safe_float(fields[6]),
+                "source_ob_net_time_us": _safe_float(fields[7]),
+                "source_ob_net_wait_time_us": _safe_float(fields[8]),
+                "source_ob_plan_type_raw": fields[9],
+                "source_ob_is_hit_plan": fields[10],
+                "source_ob_is_executor_rpc": fields[11],
+            }
+        )
+    return rows
+
+
 def sql_literal(value):
     # type: (Any) -> str
     if value is None:
@@ -517,14 +614,29 @@ def sql_literal(value):
     return "'" + text.replace("'", "''") + "'"
 
 
+def literalize_bind_vars(bind_vars):
+    # type: (Optional[Dict[str, Any]]) -> Tuple[Dict[str, str], Optional[str]]
+    rendered = {}
+    if not bind_vars:
+        return rendered, None
+    unsupported_keys = []
+    for key, value in bind_vars.items():
+        if isinstance(value, (dict, list, set, tuple)):
+            unsupported_keys.append(str(key))
+            continue
+        rendered[str(key)] = sql_literal(value)
+    if unsupported_keys:
+        return rendered, "unsupported bind types for keys: %s" % ", ".join(sorted(unsupported_keys))
+    return rendered, None
+
+
 def apply_bind_literals(sql_text, bind_vars):
     # type: (str, Optional[Dict[str, Any]]) -> str
     rendered = str(sql_text or "")
-    if not bind_vars:
+    literal_map, _ = literalize_bind_vars(bind_vars)
+    if not literal_map:
         return rendered
-    for key, value in sorted(bind_vars.items(), key=lambda item: len(str(item[0])), reverse=True):
-        literal = sql_literal(value)
-        key_text = str(key)
+    for key_text, literal in sorted(literal_map.items(), key=lambda item: len(str(item[0])), reverse=True):
         if key_text.isdigit():
             patterns = [
                 r":B%s\b" % re.escape(key_text),
@@ -537,11 +649,27 @@ def apply_bind_literals(sql_text, bind_vars):
     return rendered
 
 
+def render_sql_for_replay(sql_text, bind_vars):
+    # type: (str, Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]
+    _, skip_reason = literalize_bind_vars(bind_vars)
+    if skip_reason:
+        return None, skip_reason
+    return apply_bind_literals(sql_text, bind_vars), None
+
+
 def derive_replay_metrics(row):
     # type: (Dict[str, Any]) -> Dict[str, Any]
-    oracle_elapsed = float(row.get("oracle_avg_elapsed_us") or 0.0)
+    oracle_elapsed = float(
+        row.get("baseline_avg_elapsed_us")
+        or row.get("oracle_avg_elapsed_us")
+        or 0.0
+    )
     ob_elapsed = float(row.get("ob_elapsed_us") or row.get("ob_wall_time_us") or 0.0)
-    oracle_reads = float(row.get("oracle_avg_logical_reads") or 0.0)
+    oracle_reads = float(
+        row.get("baseline_avg_logical_reads")
+        or row.get("oracle_avg_logical_reads")
+        or 0.0
+    )
     ob_reads = float(row.get("ob_logical_reads") or 0.0)
     ob_net = float(row.get("ob_net_time_us") or 0.0)
     speedup_ratio = None
@@ -571,6 +699,15 @@ def build_recommendations(row, slowdown_threshold):
     speedup_ratio = row.get("speedup_ratio")
     net_ratio = row.get("net_ratio")
     if row.get("ob_status") not in (None, "", "ok"):
+        if row.get("ob_status") == "skip":
+            recommendations.append(
+                {
+                    "rule_id": "REPLAY-SKIP",
+                    "message": "Replay was skipped because the SQL could not be rendered safely",
+                    "hint_sql": "-- Review bind values and convert unsupported types before replaying",
+                }
+            )
+            return recommendations
         recommendations.append(
             {
                 "rule_id": "REPLAY-ERROR",
@@ -753,6 +890,15 @@ def validate_runtime_paths(config):
             "obclient executable exists but is not executable: %s" % str(obclient_path)
         )
 
+    if config.settings.get("source_db_mode") == SOURCE_DB_MODE_OCEANBASE:
+        source_ob_path = Path(config.oceanbase_source.get("executable", "")).expanduser()
+        if not source_ob_path.exists():
+            result.errors.append("source obclient executable not found: %s" % str(source_ob_path))
+        elif not os.access(str(source_ob_path), os.X_OK):
+            result.warnings.append(
+                "source obclient executable exists but is not executable: %s" % str(source_ob_path)
+            )
+
     if oracledb is None:
         result.warnings.append(
             "python-oracledb is not installed in the current environment; Oracle capture will not run"
@@ -764,7 +910,7 @@ def validate_runtime_paths(config):
 def summarize_config(config):
     # type: (AppConfig) -> Dict[str, Any]
     host, port, service_name = parse_oracle_dsn(config.oracle_source["dsn"])
-    return {
+    summary = {
         "config_path": config.config_path,
         "oracle_source": {
             "user": config.oracle_source["user"],
@@ -780,6 +926,14 @@ def summarize_config(config):
         },
         "settings": config.settings,
     }
+    if config.oceanbase_source:
+        summary["oceanbase_source"] = {
+            "executable": config.oceanbase_source["executable"],
+            "host": config.oceanbase_source["host"],
+            "port": config.oceanbase_source["port"],
+            "user_string": config.oceanbase_source["user_string"],
+        }
+    return summary
 
 
 def _print_preflight(result):
@@ -917,6 +1071,9 @@ def capture_from_sql_file(config, sql_file, run_id):
                 "schema": default_schema,
                 "source": "sql_file",
                 "captured_at": utc_now_iso(),
+                "baseline_source_mode": SOURCE_DB_MODE_ORACLE,
+                "baseline_avg_elapsed_us": None,
+                "baseline_avg_logical_reads": None,
                 "oracle_executions": 1,
                 "oracle_avg_elapsed_us": None,
                 "oracle_avg_cpu_us": None,
@@ -980,11 +1137,18 @@ def _read_oracle_plan_rows(connection, sql_id, use_awr=False):
         cursor.close()
 
 
-def _capture_from_vsql(connection, config):
-    # type: (Any, AppConfig) -> List[Dict[str, Any]]
+def _capture_from_vsql(connection, config, since_ts=None):
+    # type: (Any, AppConfig, Optional[str]) -> List[Dict[str, Any]]
     schemas = config.settings["source_schemas"]
     placeholders, binds = _oracle_schema_placeholders("schema", schemas)
     binds.update({"hours": int(config.settings["hours"]), "min_exec": int(config.settings["min_exec"]), "top_n": int(config.settings["top_n"])})
+    time_filter = (
+        "AND LAST_ACTIVE_TIME > TO_TIMESTAMP(:since_ts, 'YYYY-MM-DD\"T\"HH24:MI:SS')"
+        if since_ts
+        else "AND LAST_ACTIVE_TIME >= SYSTIMESTAMP - NUMTODSINTERVAL(:hours, 'HOUR')"
+    )
+    if since_ts:
+        binds["since_ts"] = since_ts
     query = """
         SELECT * FROM (
           SELECT
@@ -1001,10 +1165,10 @@ def _capture_from_vsql(connection, config):
           FROM V$SQL
           WHERE PARSING_SCHEMA_NAME IN ({placeholders})
             AND EXECUTIONS >= :min_exec
-            AND LAST_ACTIVE_TIME >= SYSTIMESTAMP - NUMTODSINTERVAL(:hours, 'HOUR')
+            {time_filter}
           ORDER BY AVG_ELAPSED_US DESC
         ) WHERE ROWNUM <= :top_n
-    """.format(placeholders=placeholders)
+    """.format(placeholders=placeholders, time_filter=time_filter)
     cursor = connection.cursor()
     cursor.execute(query, binds)
     rows = []
@@ -1020,6 +1184,9 @@ def _capture_from_vsql(connection, config):
                 "schema": _coerce_jsonable(row[2]),
                 "source": "vsql",
                 "captured_at": _coerce_jsonable(row[9]) or utc_now_iso(),
+                "baseline_source_mode": SOURCE_DB_MODE_ORACLE,
+                "baseline_avg_elapsed_us": float(row[4]) if row[4] is not None else None,
+                "baseline_avg_logical_reads": float(row[6]) if row[6] is not None else None,
                 "oracle_executions": int(row[3]) if row[3] is not None else 0,
                 "oracle_avg_elapsed_us": float(row[4]) if row[4] is not None else None,
                 "oracle_avg_cpu_us": float(row[5]) if row[5] is not None else None,
@@ -1081,6 +1248,9 @@ def _capture_from_awr(connection, config):
                 "schema": _coerce_jsonable(row[2]),
                 "source": "awr",
                 "captured_at": _coerce_jsonable(row[9]) or utc_now_iso(),
+                "baseline_source_mode": SOURCE_DB_MODE_ORACLE,
+                "baseline_avg_elapsed_us": float(row[4]) if row[4] is not None else None,
+                "baseline_avg_logical_reads": float(row[6]) if row[6] is not None else None,
                 "oracle_executions": int(row[3]) if row[3] is not None else 0,
                 "oracle_avg_elapsed_us": float(row[4]) if row[4] is not None else None,
                 "oracle_avg_cpu_us": float(row[5]) if row[5] is not None else None,
@@ -1094,8 +1264,91 @@ def _capture_from_awr(connection, config):
     return rows
 
 
+def _build_source_ob_audit_query(last_request_id):
+    # type: (int) -> str
+    return """
+        SELECT
+          REQUEST_ID,
+          TRACE_ID,
+          SQL_ID,
+          ELAPSED_TIME,
+          QUEUE_TIME,
+          GET_PLAN_TIME,
+          EXECUTE_TIME,
+          NET_TIME,
+          NET_WAIT_TIME,
+          PLAN_TYPE,
+          IS_HIT_PLAN,
+          IS_EXECUTOR_RPC,
+          LOGICAL_READ_COUNT,
+          PHYSICAL_READ_COUNT,
+          SQL_TEXT
+        FROM GV$OB_SQL_AUDIT
+        WHERE REQUEST_ID > {last_request_id}
+        ORDER BY REQUEST_ID
+    """.format(last_request_id=int(last_request_id))
+
+
+def _obclient_run_sql_on_source(config, sql_text, timeout=None, session_query_timeout_us=0):
+    # type: (AppConfig, str, Optional[int], int) -> Tuple[bool, str, str]
+    return obclient_run_sql(
+        config.oceanbase_source,
+        sql_text,
+        timeout=timeout,
+        session_query_timeout_us=session_query_timeout_us,
+    )
+
+
+def capture_workload_from_ob_source(config, args, run_id):
+    # type: (AppConfig, argparse.Namespace, str) -> Path
+    replay_capabilities = probe_replay_capabilities(config)
+    replay_capabilities["run_id"] = run_id
+    capture_capabilities = {
+        "run_id": run_id,
+        "source_mode": SOURCE_DB_MODE_OCEANBASE,
+        "source_obclient_executable": config.oceanbase_source.get("executable"),
+        "source_obclient_host": config.oceanbase_source.get("host"),
+        "sql_audit": True,
+    }
+    write_capability_files(config, run_id, capture_capabilities, replay_capabilities)
+    workload_path = build_artifact_path("workload", run_id, root_dir=config.settings["workloads_dir"])
+    duration = int(getattr(args, "duration", 0) or config.settings.get("duration", 0) or (int(config.settings.get("hours", DEFAULT_HOURS)) * 3600))
+    duration = max(1, duration)
+    poll_interval = max(1, int(config.settings.get("interval", DEFAULT_INTERVAL)))
+    started = time.time()
+    last_request_id = 0
+    default_schema = config.settings["source_schemas"][0]
+    while True:
+        ok, stdout, stderr = _obclient_run_sql_on_source(
+            config,
+            _build_source_ob_audit_query(last_request_id),
+            timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+            session_query_timeout_us=config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
+        if not ok:
+            if time.time() - started >= duration:
+                break
+            LOG.warning("OceanBase source audit polling failed: %s", stderr or stdout)
+            time.sleep(poll_interval)
+            continue
+        rows = parse_ob_audit_rows(stdout, default_schema, captured_at=utc_now_iso())
+        if rows:
+            append_jsonl(workload_path, rows)
+            last_request_id = max(int(row.get("source_ob_request_id") or 0) for row in rows)
+        if time.time() - started >= duration:
+            break
+        time.sleep(poll_interval)
+    if not workload_path.exists():
+        raise ConfigError("OceanBase source capture did not produce any workload rows")
+    return workload_path
+
+
 def capture_workload(config, args, run_id):
     # type: (AppConfig, argparse.Namespace, str) -> Path
+    if config.settings.get("source_db_mode") == SOURCE_DB_MODE_OCEANBASE:
+        return capture_workload_from_ob_source(config, args, run_id)
     capture_capabilities = probe_oracle_capabilities(config)
     capture_capabilities["run_id"] = run_id
     capture_capabilities["oracle_dsn"] = config.oracle_source["dsn"]
@@ -1141,22 +1394,19 @@ def stream_capture_workload(config, args, run_id):
     if duration <= 0:
         duration = config.settings["interval"]
     workload_path = build_artifact_path("workload", run_id, root_dir=config.settings["workloads_dir"])
-    seen = set()  # type: set
     started = time.time()
+    watermark = None  # type: Optional[str]
     connection = _open_oracle_connection(config)
     try:
         while True:
-            rows = _capture_from_vsql(connection, config)
+            rows = _capture_from_vsql(connection, config, since_ts=watermark)
             new_rows = []
             for row in rows:
-                key = (row.get("sql_id"), row.get("captured_at"))
-                if key in seen:
-                    continue
-                seen.add(key)
                 row["source"] = "stream_vsql"
                 new_rows.append(row)
             if new_rows:
                 append_jsonl(workload_path, new_rows)
+                watermark = max(str(row.get("captured_at") or "") for row in new_rows) or watermark
             if time.time() - started >= duration:
                 break
             time.sleep(int(config.settings.get("interval", DEFAULT_INTERVAL)))
@@ -1232,33 +1482,46 @@ def _safe_float(value):
         return None
 
 
-def replay_statement(config, workload_row, audit_collector=None):
-    # type: (AppConfig, Dict[str, Any], Optional[SQLAuditCollector]) -> Dict[str, Any]
-    rendered_sql = apply_bind_literals(workload_row.get("sql_text", ""), workload_row.get("bind_vars"))
+def replay_statement(config, workload_row, audit_collector=None, backend=None):
+    # type: (AppConfig, Dict[str, Any], Optional[SQLAuditCollector], Optional[ReplayBackend]) -> Dict[str, Any]
+    backend = backend or ObclientReplayBackend()
+    rendered_sql, skip_reason = render_sql_for_replay(
+        workload_row.get("sql_text", ""), workload_row.get("bind_vars")
+    )
+    if skip_reason:
+        merged = dict(workload_row)
+        merged.update(
+            {
+                "sql_text_replayed": None,
+                "ob_status": "skip",
+                "ob_error_code": skip_reason,
+                "ob_wall_time_us": 0.0,
+                "ob_elapsed_us": None,
+                "ob_net_time_us": 0.0,
+                "ob_plan_text": "",
+                "ob_plan_error": "",
+                "ob_plan_hash": None,
+                "replayed_at": utc_now_iso(),
+                "recommendations": [],
+            }
+        )
+        merged.update(derive_replay_metrics(merged))
+        merged["recommendations"] = build_recommendations(
+            merged, slowdown_threshold=float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
+        )
+        return merged
     timeout_factor = float(config.settings.get("timeout_factor", DEFAULT_TIMEOUT_FACTOR))
-    oracle_avg_elapsed_us = _safe_float(workload_row.get("oracle_avg_elapsed_us"))
+    oracle_avg_elapsed_us = _safe_float(
+        workload_row.get("baseline_avg_elapsed_us") or workload_row.get("oracle_avg_elapsed_us")
+    )
     timeout_seconds = config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT)
     if oracle_avg_elapsed_us:
         timeout_seconds = max(1, int((oracle_avg_elapsed_us * timeout_factor) / 1000000.0) + 1)
     started_at = utc_now_iso()
     start_perf = time.perf_counter()
-    ok, stdout, stderr = obclient_run_sql(
-        config.oceanbase_target,
-        rendered_sql,
-        timeout=timeout_seconds,
-        session_query_timeout_us=config.settings.get(
-            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
-        ),
-    )
+    ok, stdout, stderr = backend.execute(config, rendered_sql, timeout_seconds)
     wall_time_us = (time.perf_counter() - start_perf) * 1000000.0
-    explain_ok, explain_stdout, explain_stderr = obclient_run_sql(
-        config.oceanbase_target,
-        "EXPLAIN EXTENDED " + rendered_sql,
-        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
-        session_query_timeout_us=config.settings.get(
-            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
-        ),
-    )
+    explain_ok, explain_stdout, explain_stderr = backend.explain(config, rendered_sql)
     audit_row = {}
     if audit_collector is not None:
         audit_collector.collect_once()
@@ -1310,13 +1573,16 @@ def replay_workload(config, workload_path, run_id):
         raise ConfigError("Workload file is empty: %s" % str(workload_path))
     audit_dump_path = build_artifact_path("audit_dump", run_id, root_dir=config.settings["workloads_dir"])
     collector = None  # type: Optional[SQLAuditCollector]
+    backend = ObclientReplayBackend()
     if replay_capabilities.get("sql_audit"):
         collector = SQLAuditCollector(config, audit_dump_path)
         collector.start()
     replay_rows = []
     try:
         for workload_row in workload_rows:
-            replay_rows.append(replay_statement(config, workload_row, audit_collector=collector))
+            replay_rows.append(
+                replay_statement(config, workload_row, audit_collector=collector, backend=backend)
+            )
     finally:
         if collector is not None:
             collector.stop()
@@ -1374,12 +1640,12 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
     for idx, row in enumerate(selected_rows, 1):
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
         summary_lines.append(
-            "%d. sql_id=%s speedup_ratio=%s oracle_us=%s ob_us=%s rules=%s"
+            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s"
             % (
                 idx,
                 row.get("sql_id"),
                 _format_ratio(row.get("speedup_ratio")),
-                row.get("oracle_avg_elapsed_us"),
+                row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us"),
                 row.get("ob_elapsed_us"),
                 rule_ids,
             )
@@ -1392,7 +1658,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
             "<tr><td>{sql_id}</td><td>{speedup}</td><td>{oracle}</td><td>{ob}</td><td>{rules}</td><td><pre>{sql}</pre></td></tr>".format(
                 sql_id=html.escape(str(row.get("sql_id"))),
                 speedup=html.escape(_format_ratio(row.get("speedup_ratio"))),
-                oracle=html.escape(str(row.get("oracle_avg_elapsed_us"))),
+                oracle=html.escape(str(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us"))),
                 ob=html.escape(str(row.get("ob_elapsed_us"))),
                 rules=html.escape(",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"),
                 sql=html.escape(str(row.get("sql_text") or "")),
@@ -1410,7 +1676,7 @@ pre { white-space: pre-wrap; margin: 0; }
 <h1>perf_comparator report</h1>
 <p>Run ID: %s</p>
 <table>
-<thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Oracle Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>SQL</th></tr></thead>
+<thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Baseline Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>SQL</th></tr></thead>
 <tbody>%s</tbody></table></body></html>
 """ % (html.escape(run_id), "".join(html_rows))
     write_text(html_path, html_content)

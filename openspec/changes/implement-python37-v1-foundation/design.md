@@ -19,6 +19,8 @@ There is also an operational baseline already in use in `~/comparator`:
 
 This existing contract should be preserved so operators can reuse established configuration habits and secret-handling expectations.
 
+An additional customer workflow must now be supported: some teams start business-function and package performance testing directly on OceanBase before final migration signoff. In that case, the tool needs to capture workload from OceanBase itself over a long-running observation window, for example 24 hours, and record every observed SQL event for later replay and analysis.
+
 ## Goals / Non-Goals
 
 **Goals:**
@@ -28,6 +30,7 @@ This existing contract should be preserved so operators can reuse established co
 - Keep the staged JSONL pipeline from the original design so that capture, replay, and reporting remain independently rerunnable.
 - Define a connector strategy that works in intranet environments and preserves a future path to native OBCI integration.
 - Keep dependencies lightweight and installation-friendly for customer servers.
+- Support both Oracle-source capture and OceanBase-source capture without splitting the runtime into multiple programs.
 
 **Non-Goals:**
 
@@ -108,7 +111,25 @@ Alternative considered:
 
 Rejected for v1 because the official OceanBase Python documentation is centered on `PyMySQL`, while Oracle-mode low-level compatibility is documented through OBCI, not a Python-native connector.
 
-### 5. Keep OceanBase diagnostics in a separate daemon thread or subprocess controlled by the same program
+### 5. Support `source_db_mode=oceanbase` for source-side workload capture
+
+When the source system is OceanBase, the capture stage will poll `GV$OB_SQL_AUDIT` from `[OCEANBASE_SOURCE]` for the configured observation window and write one workload event per observed SQL execution.
+
+Implementation direction:
+
+- Add `source_db_mode` to config with `oracle` and `oceanbase` values
+- Reuse comparator-style `[OCEANBASE_SOURCE] executable/host/port/user_string/password`
+- In OceanBase source mode, treat `duration` as the live observation window and poll SQL Audit incrementally by `REQUEST_ID`
+- Persist each observed SQL execution as a workload event instead of aggregating away individual executions
+- Map source-side elapsed and read metrics into baseline fields so replay and report stages continue to work
+
+Alternative considered:
+
+- Support only Oracle-source capture in v1
+
+Rejected because customers may already be testing business and package performance directly on OceanBase, and that workflow would otherwise be invisible to the tool.
+
+### 6. Keep OceanBase diagnostics in a separate daemon thread or subprocess controlled by the same program
 
 The SQL Audit ring buffer constraint remains valid regardless of language. The audit collector will run independently from replay execution under the same top-level Python program, poll on a sub-500ms cadence, and append rows immediately to `audit_dump_<ts>.jsonl`.
 
@@ -124,7 +145,7 @@ Alternative considered:
 
 Rejected because buffer eviction under concurrent replay would make that approach unreliable.
 
-### 6. Reserve OBCI for a later native bridge, not the initial Python implementation
+### 7. Reserve OBCI for a later native bridge, not the initial Python implementation
 
 The OBCI documentation is still valuable because it defines the long-term native path: install prerequisites, link model, OCI lifecycle, and trace metadata APIs. However, the operational cost is non-trivial: RPM deployment, GCC toolchain, `libobclient`, and Oracle headers.
 
@@ -141,7 +162,7 @@ Alternative considered:
 
 Rejected because it introduces native build, packaging, and ABI complexity before the baseline product behavior is proven.
 
-### 7. Prefer Python standard library components unless a dependency is clearly justified
+### 8. Prefer Python standard library components unless a dependency is clearly justified
 
 The first implementation should rely on:
 
@@ -168,6 +189,7 @@ Rejected because it works against the deployment constraint and offers little va
 - [Single-file program grows too large] -> Keep explicit section boundaries, narrow helper functions, and documented internal class ownership within the one-file constraint.
 - [Configuration drift from comparator confuses operators] -> Reuse comparator's section names, key names, and DSN or `user_string` semantics unless a new field is strictly required.
 - [OceanBase password leaks through command line or logs] -> Mirror comparator's secure invocation pattern by avoiding plain-text password arguments and redacting sensitive config values in logs.
+- [OceanBase source capture over 24 hours produces very large workload files] -> Keep append-only JSONL, preserve every event, and allow later report filtering and top-N ranking instead of truncating capture results.
 - [SQL Audit data loss under load] -> Keep the independent daemon, poll every 300ms by default, and persist rows immediately to JSONL.
 - [Future OBCI adoption requires native packaging] -> Keep OBCI behind a replay backend interface so the rest of the codebase is unaffected when the native path is introduced.
 
@@ -175,10 +197,11 @@ Rejected because it works against the deployment constraint and offers little va
 
 1. Establish the single-file Python 3.7 program skeleton, comparator-compatible config loading, requirements pinning, and JSONL utilities.
 2. Implement Oracle capability probing and batch or stream workload capture with `python-oracledb`.
-3. Implement the OceanBase replay adapter on top of `obclient`, plus replay capability probing and explain-plan capture.
-4. Implement the SQL Audit daemon and correlation logic.
-5. Implement report generation and the first rule set.
-6. Add validation scripts and deployment documentation for intranet installation.
+3. Implement OceanBase source capture through SQL Audit polling for long-running OB-first test windows.
+4. Implement the OceanBase replay adapter on top of `obclient`, plus replay capability probing and explain-plan capture.
+5. Implement the SQL Audit daemon and correlation logic.
+6. Implement report generation and the first rule set.
+7. Add validation scripts and deployment documentation for intranet installation.
 
 Rollback strategy:
 

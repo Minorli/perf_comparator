@@ -62,6 +62,12 @@ The system SHALL reuse the established `~/comparator` connection configuration c
 - **THEN** the configuration uses `[OCEANBASE_TARGET]` with `executable`, `host`, `port`, `user_string`, and `password`
 - **AND** `user_string` carries the full `obclient -u` identity value
 
+#### Scenario: OceanBase source mode is enabled
+- **GIVEN** an operator wants to capture workload directly from OceanBase
+- **WHEN** `[SETTINGS].source_db_mode` is set to `oceanbase`
+- **THEN** the configuration also requires `[OCEANBASE_SOURCE]` with `executable`, `host`, `port`, `user_string`, and `password`
+- **AND** the runtime uses that section for source-side workload capture
+
 #### Scenario: OceanBase password is passed to obclient
 - **GIVEN** the replay stage is about to invoke `obclient`
 - **WHEN** the target password is supplied to the client process
@@ -82,3 +88,19 @@ The system SHALL keep OceanBase Oracle-mode replay behind a backend abstraction 
 - **WHEN** the replay backend is switched from the baseline path to the OBCI-backed path
 - **THEN** the upstream workload artifact format remains valid
 - **AND** the downstream reporting pipeline continues to consume the same replay schema
+
+### Requirement: OceanBase source workload capture SHALL support long-running observation windows
+The system SHALL support capturing workload directly from an OceanBase source tenant over a configured duration so OB-first business and package performance testing can be recorded and analyzed.
+
+#### Scenario: 24-hour OceanBase source capture is requested
+- **GIVEN** `[SETTINGS].source_db_mode` is `oceanbase`
+- **AND** `[OCEANBASE_SOURCE]` is configured
+- **WHEN** an operator starts a 24-hour capture window
+- **THEN** the runtime polls `GV$OB_SQL_AUDIT` incrementally during that window
+- **AND** every observed SQL execution is appended to the workload artifact
+
+#### Scenario: OceanBase source metrics feed later comparison
+- **GIVEN** workload was captured from an OceanBase source tenant
+- **WHEN** replay and reporting stages process that workload
+- **THEN** source-side elapsed and read metrics are preserved as the baseline for comparison
+- **AND** downstream analysis does not require a separate schema format

@@ -9,6 +9,7 @@ The product baseline is already clear, but the implementation path needs to matc
 - Standardize on `python-oracledb` 2.x for Oracle-side capture because it is compatible with Python 3.7.
 - Use an `obclient`-based OceanBase replay baseline for Oracle-tenant execution and diagnostics, while keeping a future OBCI-backed native bridge behind an abstraction boundary.
 - Reuse the established `~/comparator` connection config style so operators do not need to learn a new credential layout.
+- Add `source_db_mode=oceanbase` so workload can be captured directly from an OceanBase source tenant during business-function and package performance testing windows.
 - Break the first implementation into staged tasks covering CLI/config, Oracle capture, OceanBase replay and SQL Audit collection, reporting, and validation.
 
 ## Capabilities
@@ -25,5 +26,6 @@ None.
 - Replaces a multi-module code layout with a single-file program layout centered on `perf_comparator.py`.
 - Introduces connector-role separation between Oracle capture, OceanBase replay, and artifact persistence.
 - Aligns connection configuration with `~/comparator` by reusing `[ORACLE_SOURCE]`, `[OCEANBASE_TARGET]`, and related field semantics.
+- Introduces optional `[OCEANBASE_SOURCE]` configuration and source-side SQL Audit polling for OB-first test workflows.
 - Preserves existing baseline capabilities under `openspec/specs/` without changing product goals or report outputs.
 - Reduces implementation risk by avoiding a hard dependency on native OBCI integration in the first delivery while preserving a clean upgrade path.

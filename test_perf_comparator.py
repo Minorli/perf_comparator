@@ -1,3 +1,4 @@
+import argparse
 import io
 import os
 import stat
@@ -57,6 +58,9 @@ class PerfComparatorConfigTests(unittest.TestCase):
                     user = scott
                     password = tiger
                     dsn = 127.0.0.1:1521/ORCL
+
+                    [SETTINGS]
+                    source_schemas = APP
                     """
                 ).strip()
                 + "\n",
@@ -67,6 +71,78 @@ class PerfComparatorConfigTests(unittest.TestCase):
                 perf_comparator.load_config(str(config_path))
 
             self.assertIn("OCEANBASE_TARGET", str(ctx.exception))
+
+    def test_load_config_requires_ob_source_in_oceanbase_source_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(perf_comparator.ConfigError) as ctx:
+                perf_comparator.load_config(str(config_path))
+
+            self.assertIn("OCEANBASE_SOURCE", str(ctx.exception))
+
+    def test_load_config_parses_ob_source_section(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = app@test#obcluster
+                    password = source_secret
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = target_secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(str(config_path))
+
+            self.assertEqual(cfg.settings["source_db_mode"], "oceanbase")
+            self.assertEqual(cfg.oceanbase_source["host"], "127.0.0.2")
+            self.assertEqual(cfg.oceanbase_source["user_string"], "app@test#obcluster")
 
 
 class PerfComparatorUtilityTests(unittest.TestCase):
@@ -117,6 +193,14 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertIn("'ACTIVE'", rendered)
         self.assertIn("42", rendered)
 
+    def test_render_sql_for_replay_returns_skip_for_unsupported_bind_types(self):
+        rendered, skip_reason = perf_comparator.render_sql_for_replay(
+            "SELECT * FROM orders WHERE payload = :1",
+            {"1": {"complex": "value"}},
+        )
+        self.assertIsNone(rendered)
+        self.assertIn("unsupported bind types", skip_reason)
+
     def test_derive_replay_metrics_calculates_speedup_ratio(self):
         row = {
             "oracle_avg_elapsed_us": 400.0,
@@ -146,6 +230,24 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
         self.assertTrue(any(item["rule_id"] == "DIST-JOIN" for item in recommendations))
         self.assertTrue(any(item["rule_id"] == "PLAN-CHANGED" for item in recommendations))
+
+    def test_build_recommendations_handles_skip_status(self):
+        row = {"ob_status": "skip", "speedup_ratio": None, "net_ratio": None}
+        recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
+        self.assertEqual(recommendations[0]["rule_id"], "REPLAY-SKIP")
+
+    def test_parse_ob_audit_rows_into_workload_events(self):
+        stdout = (
+            "101\ttrace-1\tsql-1\t1200\t30\t20\t1150\t800\t20\t3\t1\t1\t90\t4\tSELECT * FROM orders\n"
+            "102\ttrace-2\tsql-2\t600\t10\t10\t580\t100\t5\t1\t1\t0\t20\t1\tBEGIN pkg.run(); END"
+        )
+        rows = perf_comparator.parse_ob_audit_rows(stdout, "APP", captured_at="2026-04-22T15:00:00Z")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["sql_id"], "sql-1")
+        self.assertEqual(rows[0]["source"], "ob_sql_audit")
+        self.assertEqual(rows[0]["baseline_source_mode"], "oceanbase")
+        self.assertEqual(rows[0]["oracle_avg_elapsed_us"], 1200.0)
+        self.assertEqual(rows[1]["sql_text"], "BEGIN pkg.run(); END")
 
 
 class PerfComparatorObclientTests(unittest.TestCase):
@@ -183,6 +285,7 @@ class PerfComparatorObclientTests(unittest.TestCase):
     def test_validate_runtime_paths_reports_missing_obclient(self):
         cfg = perf_comparator.AppConfig(
             oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+            oceanbase_source={},
             oceanbase_target={
                 "executable": "/path/does/not/exist/obclient",
                 "host": "127.0.0.1",
@@ -198,6 +301,32 @@ class PerfComparatorObclientTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(any("obclient" in item for item in result.errors))
+
+    def test_validate_runtime_paths_checks_ob_source_when_enabled(self):
+        cfg = perf_comparator.AppConfig(
+            oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+            oceanbase_source={
+                "executable": "/path/does/not/exist/source-obclient",
+                "host": "127.0.0.2",
+                "port": "2883",
+                "user_string": "app@test#obcluster",
+                "password": "secret",
+            },
+            oceanbase_target={
+                "executable": "/bin/echo",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@test#obcluster",
+                "password": "secret",
+            },
+            settings={"source_db_mode": "oceanbase", "ob_session_query_timeout_us": 0, "source_schemas": ["APP"]},
+            config_path="config.ini",
+        )
+
+        result = perf_comparator.validate_runtime_paths(cfg)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("source obclient" in item.lower() for item in result.errors))
 
 
 class PerfComparatorCliTests(unittest.TestCase):
@@ -300,6 +429,164 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertEqual(len(html_files), 1)
             self.assertEqual(len(hints_files), 1)
             self.assertIn("sql-1", summary_files[0].read_text(encoding="utf-8"))
+
+    def test_report_only_mode_matches_fixture_summary(self):
+        fixture_path = Path(__file__).parent / "tests" / "fixtures" / "expected_report_summary.txt"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153000.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "oracle_avg_elapsed_us": 1000.0,
+                    "baseline_avg_elapsed_us": 1000.0,
+                    "oracle_avg_logical_reads": 20.0,
+                    "baseline_avg_logical_reads": 20.0,
+                    "oracle_plan_hash": "ora-1",
+                },
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "ob_status": "ok",
+                    "ob_elapsed_us": 3000.0,
+                    "ob_logical_reads": 60.0,
+                    "ob_net_time_us": 2100.0,
+                    "ob_plan_hash": "ob-1",
+                },
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+
+            self.assertEqual(exit_code, 0)
+            summary_path = next(report_dir.glob("perf_report_*_summary.txt"))
+            actual = summary_path.read_text(encoding="utf-8").strip()
+            actual = actual.replace(summary_path.name.split("_summary.txt")[0].split("perf_report_")[1], "<RUN_ID>")
+            actual = actual.replace(str(replay_path), "<REPLAY_PATH>")
+            expected = fixture_path.read_text(encoding="utf-8").strip()
+            self.assertEqual(actual, expected)
+
+    def test_stream_mode_appends_only_new_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            workloads_dir = Path(tmpdir) / "workloads"
+            report_dir = Path(tmpdir) / "reports"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    duration = 1
+                    interval = 1
+                    """
+                ).strip().format(workloads_dir=workloads_dir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            first = [
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT 1 FROM dual",
+                    "captured_at": "2026-04-22T10:00:00",
+                    "oracle_avg_elapsed_us": 1000.0,
+                    "oracle_avg_logical_reads": 10.0,
+                    "oracle_plan_hash": "a",
+                }
+            ]
+            second = [
+                {
+                    "sql_id": "sql-2",
+                    "sql_text": "SELECT 2 FROM dual",
+                    "captured_at": "2026-04-22T10:00:01",
+                    "oracle_avg_elapsed_us": 900.0,
+                    "oracle_avg_logical_reads": 8.0,
+                    "oracle_plan_hash": "b",
+                }
+            ]
+
+            mock_connection = mock.Mock()
+            with mock.patch.object(
+                perf_comparator,
+                "probe_oracle_capabilities",
+                return_value={"awr": False, "vsql": True, "oracle_driver_available": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "probe_replay_capabilities",
+                return_value={"obclient": True, "connectivity_ok": True, "explain": True, "sql_audit": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "_open_oracle_connection",
+                return_value=mock_connection,
+            ), mock.patch.object(
+                perf_comparator,
+                "_capture_from_vsql",
+                side_effect=[first, second],
+            ), mock.patch.object(
+                perf_comparator.time,
+                "sleep",
+                return_value=None,
+            ), mock.patch.object(
+                perf_comparator.time,
+                "time",
+                side_effect=[0.0, 0.0, 2.0],
+            ):
+                workload_path = perf_comparator.stream_capture_workload(
+                    perf_comparator.load_config(str(config_path)),
+                    argparse.Namespace(duration=1, sql_file=None),
+                    "20260422_155500",
+                )
+
+            rows = perf_comparator.read_jsonl(workload_path)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["sql_id"], "sql-1")
+            self.assertEqual(rows[1]["sql_id"], "sql-2")
 
     def test_batch_mode_from_sql_file_generates_full_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -417,6 +704,80 @@ class PerfComparatorCliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(len(list(workloads_dir.glob("replay_*.jsonl"))), 1)
+
+    def test_batch_mode_supports_oceanbase_source_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            workloads_dir = Path(tmpdir) / "workloads"
+            report_dir = Path(tmpdir) / "reports"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = app@test#obcluster
+                    password = source_secret
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = target_secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    duration = 1
+                    interval = 1
+                    """
+                ).strip().format(workloads_dir=workloads_dir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            audit_stdout = "101\ttrace-1\tsql-1\t1200\t30\t20\t1150\t800\t20\t3\t1\t1\t90\t4\tSELECT * FROM orders"
+            with mock.patch.object(
+                perf_comparator,
+                "probe_oracle_capabilities",
+                return_value={"oracle_driver_available": False, "sql_file": True},
+            ), mock.patch.object(
+                perf_comparator,
+                "probe_replay_capabilities",
+                return_value={"obclient": True, "connectivity_ok": True, "explain": True, "sql_audit": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "obclient_run_sql",
+                side_effect=[
+                    (True, audit_stdout, ""),
+                    (True, "", ""),
+                    (True, "plan rows", ""),
+                    (True, "", ""),
+                ],
+            ), mock.patch.object(
+                perf_comparator.time,
+                "sleep",
+                return_value=None,
+            ), mock.patch.object(
+                perf_comparator.time,
+                "time",
+                side_effect=[0.0, 2.0],
+            ):
+                exit_code = perf_comparator.main(
+                    ["--mode", "batch", "--config", str(config_path)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(list(workloads_dir.glob("workload_*.jsonl"))), 1)
 
 
 if __name__ == "__main__":

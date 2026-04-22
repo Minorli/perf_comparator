@@ -37,6 +37,15 @@ perf_comparator runtime setup
   - user_string
   - password
 
+- OceanBase source capture:
+  - [OCEANBASE_SOURCE]
+  - executable
+  - host
+  - port
+  - user_string
+  - password
+  - used when [SETTINGS].source_db_mode = oceanbase
+
 - Example starting point:
   - config.ini.template
 
@@ -50,8 +59,24 @@ perf_comparator runtime setup
 - Validate config and runtime prerequisites:
   - python3 perf_comparator.py --mode check-config --config config.ini
 
-- Other modes are scaffolded but not implemented yet:
-  - batch
-  - stream
-  - replay-only
-  - report-only
+7. Current supported modes
+
+- `batch`
+  - Oracle source:
+    - python3 perf_comparator.py --mode batch --config config.ini
+  - manual SQL file:
+    - python3 perf_comparator.py --mode batch --config config.ini --sql-file input.sql
+  - OceanBase source capture:
+    - set `[SETTINGS].source_db_mode = oceanbase`
+    - set `[OCEANBASE_SOURCE]`
+    - run `python3 perf_comparator.py --mode batch --config config.ini --duration 86400`
+    - this polls `GV$OB_SQL_AUDIT` during the capture window and records every observed SQL event into workload JSONL
+
+- `replay-only`
+  - python3 perf_comparator.py --mode replay-only --config config.ini --workload workloads/workload_<ts>.jsonl
+
+- `report-only`
+  - python3 perf_comparator.py --mode report-only --config config.ini --replay workloads/replay_<ts>.jsonl
+
+- `stream`
+  - Oracle source only in the current implementation
