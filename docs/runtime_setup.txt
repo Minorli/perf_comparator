@@ -28,6 +28,7 @@ perf_comparator runtime setup
   - user
   - password
   - dsn = host:port/service_name
+  - Unified Audit capture is used automatically when AWR and V$SQL are unavailable
 
 - OceanBase target:
   - [OCEANBASE_TARGET]
@@ -59,6 +60,12 @@ perf_comparator runtime setup
 - Example starting point:
   - config.ini.template
 
+- Optional WCR input:
+  - [SETTINGS]
+  - wcr_path = /path/to/workload_capture_export.jsonl
+  - or pass `--wcr-path` on the command line
+  - used as a fallback when AWR, V$SQL, and Unified Audit are unavailable
+
 5. Security handling
 
 - OceanBase passwords are not passed as plain-text process arguments.
@@ -76,6 +83,8 @@ perf_comparator runtime setup
     - python3 perf_comparator.py --mode batch --config config.ini
   - manual SQL file:
     - python3 perf_comparator.py --mode batch --config config.ini --sql-file input.sql
+  - WCR import:
+    - python3 perf_comparator.py --mode batch --config config.ini --wcr-path workloads/sample.wcr
   - OceanBase source capture:
     - set `[SETTINGS].source_db_mode = oceanbase`
     - set `[OCEANBASE_SOURCE]`

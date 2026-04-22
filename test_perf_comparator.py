@@ -386,6 +386,213 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertTrue(any(item["rule_id"] == "DIST-JOIN" for item in recommendations))
         self.assertTrue(any(item["rule_id"] == "PLAN-CHANGED" for item in recommendations))
 
+    def test_build_recommendations_emits_executable_dist_join_and_plan_miss_templates(self):
+        row = {
+            "sql_id": "sql-join-1",
+            "sql_text": "SELECT * FROM orders o JOIN order_items i ON i.order_id = o.id",
+            "ob_status": "ok",
+            "speedup_ratio": 0.4,
+            "net_ratio": 0.8,
+            "plan_changed": False,
+            "ob_is_executor_rpc": "1",
+            "ob_queue_time_us": 100.0,
+            "ob_execute_time_us": 1000.0,
+            "ob_retry_cnt": 0,
+            "ob_is_hit_plan": "0",
+            "ob_get_plan_time_us": 400.0,
+            "ob_elapsed_us": 1200.0,
+            "ob_memstore_read_rows": 100.0,
+            "ob_ssstore_read_rows": 50.0,
+            "ob_bloom_filter_filtered": 0.0,
+            "schema": "APP",
+        }
+
+        recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
+        recommendation_map = {item["rule_id"]: item for item in recommendations}
+
+        self.assertIn("CREATE TABLEGROUP", recommendation_map["DIST-JOIN"]["hint_sql"])
+        self.assertIn("ALTER TABLE orders SET TABLEGROUP", recommendation_map["DIST-JOIN"]["hint_sql"])
+        self.assertIn("ALTER TABLE order_items SET TABLEGROUP", recommendation_map["DIST-JOIN"]["hint_sql"])
+        self.assertIn("DBMS_STATS.GATHER_TABLE_STATS", recommendation_map["PLAN-MISS"]["hint_sql"])
+        self.assertIn("CALL DBMS_XPLAN.ENABLE_OPT_TRACE()", recommendation_map["PLAN-MISS"]["hint_sql"])
+
+    def test_build_recommendations_links_plsql_rpc_to_profiler_hotspot(self):
+        row = {
+            "sql_id": "pkg-1",
+            "sql_text": "BEGIN insurance_workload_pkg_small.run_profile_workload; END",
+            "ob_status": "ok",
+            "speedup_ratio": 0.5,
+            "net_ratio": 0.9,
+            "plan_changed": False,
+            "ob_is_executor_rpc": "1",
+            "ob_queue_time_us": 100.0,
+            "ob_execute_time_us": 1000.0,
+            "ob_retry_cnt": 0,
+            "ob_is_hit_plan": "1",
+            "ob_get_plan_time_us": 10.0,
+            "ob_elapsed_us": 1200.0,
+            "ob_memstore_read_rows": 100.0,
+            "ob_ssstore_read_rows": 50.0,
+            "ob_bloom_filter_filtered": 0.0,
+            "plsql_profile_status": "ok",
+            "plsql_profile_top_lines": [
+                {
+                    "owner": "OMS_USER",
+                    "unit_name": "INSURANCE_WORKLOAD_PKG_SMALL",
+                    "unit_type": "PACKAGE BODY",
+                    "line": 87,
+                    "total_time_us": 820000.0,
+                    "source_text": "FOR i IN 1..v_ids.COUNT LOOP",
+                    "context_lines": [
+                        {"line": 86, "text": "FOR i IN 1..v_ids.COUNT LOOP"},
+                        {"line": 87, "text": "UPDATE orders SET status = 'DONE' WHERE id = v_ids(i);"},
+                    ],
+                }
+            ],
+        }
+
+        recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
+        recommendation_map = {item["rule_id"]: item for item in recommendations}
+
+        self.assertIn("line 87", recommendation_map["PLSQL-RPC"]["message"])
+        self.assertIn("FORALL", recommendation_map["PLSQL-RPC"]["hint_sql"])
+        self.assertIn("MERGE INTO", recommendation_map["PLSQL-RPC"]["hint_sql"])
+        self.assertIn("INSURANCE_WORKLOAD_PKG_SMALL", recommendation_map["PLSQL-RPC"]["hint_sql"])
+
+
+class PerfComparatorOracleCaptureTests(unittest.TestCase):
+    def _build_config(self, tmpdir, **settings_updates):
+        settings = {
+            "source_schemas": ["APP"],
+            "hours": 24,
+            "min_exec": 5,
+            "top_n": 50,
+            "workloads_dir": tmpdir,
+            "report_dir": str(Path(tmpdir) / "reports"),
+        }
+        settings.update(settings_updates)
+        return perf_comparator.AppConfig(
+            oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+            oceanbase_source={},
+            oceanbase_target={
+                "executable": "/bin/echo",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@test#obcluster",
+                "password": "secret",
+            },
+            settings=settings,
+            config_path="config.ini",
+        )
+
+    def test_capture_workload_falls_back_to_unified_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._build_config(tmpdir)
+            mock_connection = mock.Mock()
+            expected_rows = [
+                {
+                    "sql_id": "ua-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "schema": "APP",
+                    "source": "unified_audit",
+                }
+            ]
+
+            with mock.patch.object(
+                perf_comparator,
+                "probe_oracle_capabilities",
+                return_value={"awr": False, "vsql": False, "unified_audit": True, "wcr": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "probe_replay_capabilities",
+                return_value={"obclient": True, "connectivity_ok": True, "explain": True, "sql_audit": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "_open_oracle_connection",
+                return_value=mock_connection,
+            ), mock.patch.object(
+                perf_comparator,
+                "_capture_from_unified_audit",
+                return_value=expected_rows,
+            ) as audit_mock:
+                workload_path = perf_comparator.capture_workload(
+                    config, argparse.Namespace(sql_file=None, wcr_path=None), "20260422_190000"
+                )
+
+            audit_mock.assert_called_once_with(mock_connection, config)
+            rows = perf_comparator.read_jsonl(workload_path)
+            self.assertEqual(rows[0]["source"], "unified_audit")
+
+    def test_capture_workload_falls_back_to_wcr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wcr_path = Path(tmpdir) / "sample.wcr"
+            wcr_path.write_text("SELECT * FROM invoices;\n", encoding="utf-8")
+            config = self._build_config(tmpdir, wcr_path=str(wcr_path))
+
+            with mock.patch.object(
+                perf_comparator,
+                "probe_oracle_capabilities",
+                return_value={"awr": False, "vsql": False, "unified_audit": False, "wcr": True},
+            ), mock.patch.object(
+                perf_comparator,
+                "probe_replay_capabilities",
+                return_value={"obclient": True, "connectivity_ok": True, "explain": True, "sql_audit": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "capture_from_wcr_file",
+                return_value=Path(tmpdir) / "workloads" / "workload_20260422_190001.jsonl",
+            ) as wcr_mock:
+                workload_path = perf_comparator.capture_workload(
+                    config, argparse.Namespace(sql_file=None, wcr_path=None), "20260422_190001"
+                )
+
+            wcr_mock.assert_called_once()
+            self.assertEqual(str(workload_path).endswith(".jsonl"), True)
+
+    def test_capture_workload_prefers_awr_before_wcr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wcr_path = Path(tmpdir) / "sample.wcr"
+            wcr_path.write_text("SELECT * FROM invoices;\n", encoding="utf-8")
+            config = self._build_config(tmpdir, wcr_path=str(wcr_path))
+            mock_connection = mock.Mock()
+            expected_rows = [
+                {
+                    "sql_id": "awr-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "schema": "APP",
+                    "source": "awr",
+                }
+            ]
+
+            with mock.patch.object(
+                perf_comparator,
+                "probe_oracle_capabilities",
+                return_value={"awr": True, "vsql": True, "unified_audit": True, "wcr": True},
+            ), mock.patch.object(
+                perf_comparator,
+                "probe_replay_capabilities",
+                return_value={"obclient": True, "connectivity_ok": True, "explain": True, "sql_audit": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "_open_oracle_connection",
+                return_value=mock_connection,
+            ), mock.patch.object(
+                perf_comparator,
+                "_capture_from_awr",
+                return_value=expected_rows,
+            ) as awr_mock, mock.patch.object(
+                perf_comparator,
+                "capture_from_wcr_file",
+            ) as wcr_mock:
+                workload_path = perf_comparator.capture_workload(
+                    config, argparse.Namespace(sql_file=None, wcr_path=None), "20260422_190002"
+                )
+
+            awr_mock.assert_called_once_with(mock_connection, config)
+            wcr_mock.assert_not_called()
+            rows = perf_comparator.read_jsonl(workload_path)
+            self.assertEqual(rows[0]["source"], "awr")
+
     def test_build_recommendations_handles_skip_status(self):
         row = {"ob_status": "skip", "speedup_ratio": None, "net_ratio": None}
         recommendations = perf_comparator.build_recommendations(row, slowdown_threshold=0.8)
@@ -1324,6 +1531,191 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn("plan-risk=LOOKUP-RISK", html_text)
             self.assertIn("plsql=TEST_PROFILER_PKG", html_text)
 
+    def test_report_only_mode_renders_chart_sections(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153000.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                [
+                    {
+                        "sql_id": "sql-fast",
+                        "sql_text": "SELECT * FROM fast_table",
+                        "baseline_avg_elapsed_us": 1000.0,
+                        "baseline_avg_logical_reads": 20.0,
+                        "oracle_plan_hash": "ora-1",
+                    },
+                    {
+                        "sql_id": "sql-slow",
+                        "sql_text": "SELECT * FROM slow_table",
+                        "baseline_avg_elapsed_us": 1000.0,
+                        "baseline_avg_logical_reads": 20.0,
+                        "oracle_plan_hash": "ora-2",
+                    },
+                ],
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                [
+                    {
+                        "sql_id": "sql-fast",
+                        "sql_text": "SELECT * FROM fast_table",
+                        "ob_status": "ok",
+                        "ob_elapsed_us": 800.0,
+                        "ob_logical_reads": 18.0,
+                        "ob_net_time_us": 50.0,
+                        "ob_plan_hash": "ob-1",
+                    },
+                    {
+                        "sql_id": "sql-slow",
+                        "sql_text": "SELECT * FROM slow_table",
+                        "ob_status": "ok",
+                        "ob_elapsed_us": 3000.0,
+                        "ob_logical_reads": 60.0,
+                        "ob_net_time_us": 2100.0,
+                        "ob_plan_hash": "ob-2",
+                    },
+                ],
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+
+            self.assertEqual(exit_code, 0)
+            html_path = next(report_dir.glob("perf_report_*.html"))
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn('id="overview-charts"', html_text)
+            self.assertIn('id="distribution-chart"', html_text)
+            self.assertIn('id="timing-chart"', html_text)
+            self.assertIn("<svg", html_text)
+
+    def test_report_only_mode_writes_executable_hints_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153000.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                [
+                    {
+                        "sql_id": "sql-join-1",
+                        "sql_text": "SELECT * FROM orders o JOIN order_items i ON i.order_id = o.id",
+                        "baseline_avg_elapsed_us": 1000.0,
+                        "baseline_avg_logical_reads": 20.0,
+                    },
+                    {
+                        "sql_id": "pkg-1",
+                        "sql_text": "BEGIN insurance_workload_pkg_small.run_profile_workload; END",
+                        "baseline_avg_elapsed_us": 1000.0,
+                        "baseline_avg_logical_reads": 20.0,
+                    },
+                ],
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                [
+                    {
+                        "sql_id": "sql-join-1",
+                        "sql_text": "SELECT * FROM orders o JOIN order_items i ON i.order_id = o.id",
+                        "ob_status": "ok",
+                        "ob_elapsed_us": 3000.0,
+                        "ob_logical_reads": 60.0,
+                        "ob_net_time_us": 2200.0,
+                        "ob_get_plan_time_us": 700.0,
+                        "ob_is_hit_plan": "0",
+                        "ob_plan_hash": "ob-join-1",
+                    },
+                    {
+                        "sql_id": "pkg-1",
+                        "sql_text": "BEGIN insurance_workload_pkg_small.run_profile_workload; END",
+                        "ob_status": "ok",
+                        "ob_elapsed_us": 3000.0,
+                        "ob_logical_reads": 10.0,
+                        "ob_net_time_us": 2200.0,
+                        "ob_is_executor_rpc": "1",
+                        "plsql_profile_status": "ok",
+                        "plsql_profile_top_lines": [
+                            {
+                                "owner": "OMS_USER",
+                                "unit_name": "INSURANCE_WORKLOAD_PKG_SMALL",
+                                "unit_type": "PACKAGE BODY",
+                                "line": 87,
+                                "total_time_us": 820000.0,
+                                "source_text": "FOR i IN 1..v_ids.COUNT LOOP",
+                                "context_lines": [
+                                    {"line": 87, "text": "UPDATE orders SET status = 'DONE' WHERE id = v_ids(i);"},
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+
+            self.assertEqual(exit_code, 0)
+            hints_path = next(report_dir.glob("perf_hints_*.sql"))
+            hints_text = hints_path.read_text(encoding="utf-8")
+            self.assertIn("CREATE TABLEGROUP", hints_text)
+            self.assertIn("ALTER TABLE orders SET TABLEGROUP", hints_text)
+            self.assertIn("CALL DBMS_XPLAN.ENABLE_OPT_TRACE()", hints_text)
+            self.assertIn("FORALL", hints_text)
+            self.assertIn("MERGE INTO orders", hints_text)
+
     def test_stream_mode_appends_only_new_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.ini"
@@ -1722,6 +2114,12 @@ class PerfComparatorCliTests(unittest.TestCase):
             summary_text = summary_files[0].read_text(encoding="utf-8")
             self.assertIn("Report Mode: source-only", summary_text)
             self.assertIn("sql-1", summary_text)
+            html_files = list(report_dir.glob("perf_report_*.html"))
+            self.assertEqual(len(html_files), 1)
+            html_text = html_files[0].read_text(encoding="utf-8")
+            self.assertIn('id="overview-charts"', html_text)
+            self.assertIn('id="source-distribution-chart"', html_text)
+            self.assertIn('id="source-timing-chart"', html_text)
 
     def test_generate_source_report_summary_mentions_sql_text_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmpdir:

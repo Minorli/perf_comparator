@@ -40,9 +40,11 @@ obclient_timeout = 120
 ob_session_query_timeout_us = 3600000000
 timeout_factor = 3.0
 slowdown_threshold = 0.8
+wcr_path =
 
 # Notes:
 # - Use [OCEANBASE_SOURCE] for OceanBase source capture.
 # - Use [OCEANBASE_SOURCE_SYS] for source-only diagnosis when ordinary users cannot
 #   read QUERY_SQL from GV$OB_SQL_AUDIT on OB 4.2.5.
+# - Set [SETTINGS].wcr_path or pass --wcr-path when replaying from a WCR export file.
 # - source-report mode may omit [ORACLE_SOURCE] and [OCEANBASE_TARGET].

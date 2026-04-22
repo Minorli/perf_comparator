@@ -10,6 +10,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -480,6 +482,7 @@ def load_config(config_path, execution_mode=None):
         "slowdown_threshold": _get_optional_float(
             settings_section, "slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD
         ),
+        "wcr_path": (settings_section.get("wcr_path") or "").strip(),
     }
 
     return AppConfig(
@@ -637,6 +640,41 @@ def is_internal_perf_comparator_source_sql(sql_text):
 def compute_sql_id(sql_text):
     # type: (str) -> str
     return hashlib.sha1(normalize_sql_text(sql_text).encode("utf-8")).hexdigest()[:16]
+
+
+def _split_object_name(raw_name):
+    # type: (str) -> Tuple[Optional[str], str]
+    text = str(raw_name or "").strip().strip(",")
+    if not text:
+        return None, ""
+    text = text.strip('"')
+    if "." not in text:
+        return None, text
+    schema_name, object_name = text.split(".", 1)
+    return schema_name.strip('"'), object_name.strip('"')
+
+
+def extract_table_references(sql_text):
+    # type: (str) -> List[Tuple[Optional[str], str]]
+    text = str(sql_text or "")
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"--.*?$", " ", text, flags=re.M)
+    pattern = re.compile(
+        r"\b(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO)\s+((?:\"?[A-Za-z0-9_$#]+\"?\.)?\"?[A-Za-z0-9_$#]+\"?)",
+        re.I,
+    )
+    seen = set()
+    tables = []
+    for match in pattern.finditer(text):
+        schema_name, object_name = _split_object_name(match.group(1))
+        if not object_name:
+            continue
+        key = (str(schema_name or "").upper(), object_name.upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        tables.append((schema_name, object_name))
+    return tables
 
 
 def split_sql_text(sql_text):
@@ -1718,6 +1756,170 @@ def derive_replay_metrics(row):
     }
 
 
+def _normalize_template_identifier(raw_text, fallback):
+    # type: (str, str) -> str
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(raw_text or "").strip().lower()).strip("_")
+    if not cleaned:
+        cleaned = str(fallback or "perf")
+    return cleaned[:48]
+
+
+def _is_simple_sql_identifier(value):
+    # type: (Optional[str]) -> bool
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_$#]*$", str(value or "").strip()))
+
+
+def _format_qualified_object(schema_name, object_name):
+    # type: (Optional[str], str) -> str
+    if schema_name:
+        return '"%s"."%s"' % (schema_name, object_name)
+    return '"%s"' % object_name
+
+
+def _format_template_object(schema_name, object_name, include_schema=True):
+    # type: (Optional[str], str, bool) -> str
+    normalized_object = str(object_name or "").strip() or "REPLACE_TABLE_NAME"
+    normalized_schema = str(schema_name or "").strip()
+    if include_schema and normalized_schema and _is_simple_sql_identifier(normalized_schema) and _is_simple_sql_identifier(normalized_object):
+        return "%s.%s" % (normalized_schema, normalized_object)
+    if not include_schema and _is_simple_sql_identifier(normalized_object):
+        return normalized_object
+    if include_schema and normalized_schema:
+        return _format_qualified_object(normalized_schema, normalized_object)
+    if _is_simple_sql_identifier(normalized_object):
+        return normalized_object
+    return '"%s"' % normalized_object
+
+
+def _infer_recommendation_tables(row):
+    # type: (Dict[str, Any]) -> List[Tuple[Optional[str], str]]
+    tables = extract_table_references(row.get("sql_text") or "")
+    if tables:
+        return tables
+    schema_name = str(row.get("schema") or "").strip() or None
+    return [(schema_name, "REPLACE_TABLE_NAME")]
+
+
+def _build_dist_join_hint_sql(row):
+    # type: (Dict[str, Any]) -> str
+    tablegroup_name = "tg_%s" % _normalize_template_identifier(
+        row.get("sql_id") or "dist_join", "dist_join"
+    )
+    tables = _infer_recommendation_tables(row)[:2]
+    lines = [
+        "CREATE TABLEGROUP %s;" % tablegroup_name,
+    ]
+    for schema_name, object_name in tables:
+        lines.append(
+            "ALTER TABLE %s SET TABLEGROUP %s;"
+            % (_format_template_object(schema_name, object_name, include_schema=False), tablegroup_name)
+        )
+    lines.append(
+        "ALTER TABLEGROUP %s LOCALITY = 'F@zone1';" % tablegroup_name
+    )
+    return "\n".join(lines)
+
+
+def _build_plan_miss_hint_sql(row):
+    # type: (Dict[str, Any]) -> str
+    tables = _infer_recommendation_tables(row)[:2]
+    lines = []
+    for schema_name, object_name in tables:
+        owner = schema_name or str(row.get("schema") or "APP")
+        lines.extend(
+            [
+                "BEGIN",
+                "  DBMS_STATS.GATHER_TABLE_STATS(",
+                "    ownname => '%s'," % owner,
+                "    tabname => '%s'," % object_name,
+                "    method_opt => 'FOR ALL COLUMNS SIZE AUTO'",
+                "  );",
+                "END;",
+                "/",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "CALL DBMS_XPLAN.ENABLE_OPT_TRACE();",
+            "-- Execute the target SQL and capture the preferred outline or plan hash.",
+            "CREATE OUTLINE outline_%s ON %s USING HINT /* REPLACE_WITH_CAPTURED_HINTS */;"
+            % (
+                _normalize_template_identifier(row.get("sql_id") or "plan_miss", "plan_miss"),
+                _format_template_object(
+                    tables[0][0] if tables else str(row.get("schema") or None),
+                    tables[0][1] if tables else "REPLACE_TABLE_NAME",
+                ),
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _get_profiler_hotspot(row):
+    # type: (Dict[str, Any]) -> Optional[Dict[str, Any]]
+    if row.get("plsql_profile_status") != "ok":
+        return None
+    hot_lines = row.get("plsql_profile_top_lines") or []
+    if not hot_lines:
+        return None
+    return hot_lines[0]
+
+
+def _infer_profiler_target_table(hotspot):
+    # type: (Optional[Dict[str, Any]]) -> str
+    if not hotspot:
+        return "REPLACE_TARGET_TABLE"
+    source_candidates = []
+    if hotspot.get("source_text"):
+        source_candidates.append(hotspot.get("source_text"))
+    for context_row in hotspot.get("context_lines") or []:
+        if context_row.get("text"):
+            source_candidates.append(context_row.get("text"))
+    for candidate in source_candidates:
+        tables = extract_table_references(candidate)
+        if tables:
+            _, object_name = tables[0]
+            return object_name
+    return "REPLACE_TARGET_TABLE"
+
+
+def _build_plsql_rpc_hint_sql(row):
+    # type: (Dict[str, Any]) -> str
+    hotspot = _get_profiler_hotspot(row)
+    unit_name = str(hotspot.get("unit_name") if hotspot else "REPLACE_PACKAGE")
+    line_no = hotspot.get("line") if hotspot else "?"
+    target_table = _infer_profiler_target_table(hotspot)
+    context_text = build_sql_preview(
+        hotspot.get("source_text") if hotspot else "row-by-row DML hotspot",
+        limit=140,
+    )
+    return "\n".join(
+        [
+            "-- profiler_hotspot: %s line %s" % (unit_name, line_no),
+            "-- source_line: %s" % context_text,
+            "DECLARE",
+            "  TYPE t_key_tab IS TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+            "  v_keys t_key_tab;",
+            "BEGIN",
+            "  -- Replace the cursor query below using the profiled package context.",
+            "  SELECT <pk_col> BULK COLLECT INTO v_keys FROM %s WHERE <predicate>;" % target_table,
+            "  FORALL i IN INDICES OF v_keys",
+            "    UPDATE %s SET <target_col> = <new_value_expr> WHERE <pk_col> = v_keys(i);" % target_table,
+            "END;",
+            "/",
+            "",
+            "MERGE INTO %s t" % target_table,
+            "USING (",
+            "  SELECT <pk_col>, <new_value_expr> AS new_value",
+            "  FROM <source_query>",
+            ") s",
+            "ON (t.<pk_col> = s.<pk_col>)",
+            "WHEN MATCHED THEN UPDATE SET t.<target_col> = s.new_value;",
+        ]
+    )
+
+
 def build_recommendations(row, slowdown_threshold):
     # type: (Dict[str, Any], float) -> List[Dict[str, str]]
     recommendations = []
@@ -1768,10 +1970,7 @@ def build_recommendations(row, slowdown_threshold):
             {
                 "rule_id": "DIST-JOIN",
                 "message": "Network time dominates execution; distributed execution is likely",
-                "hint_sql": (
-                    "-- Consider table-group alignment or co-location for frequent joins\n"
-                    "-- CREATE TABLEGROUP <group_name>;"
-                ),
+                "hint_sql": _build_dist_join_hint_sql(row),
             }
         )
     if (
@@ -1780,14 +1979,18 @@ def build_recommendations(row, slowdown_threshold):
         and ("BEGIN" in sql_text.upper() or "DECLARE" in sql_text.upper() or "PACKAGE" in sql_text.upper() or "PKG." in sql_text.upper())
         and str(row.get("ob_is_executor_rpc") or "").strip() in ("1", "True", "true", "YES", "yes")
     ):
+        hotspot = _get_profiler_hotspot(row)
+        message = "PL/SQL or package execution appears to trigger executor RPC overhead"
+        if hotspot:
+            message = (
+                "PL/SQL executor RPC overhead aligns with profiler hotspot at %s line %s"
+                % (hotspot.get("unit_name"), hotspot.get("line"))
+            )
         recommendations.append(
             {
                 "rule_id": "PLSQL-RPC",
-                "message": "PL/SQL or package execution appears to trigger executor RPC overhead",
-                "hint_sql": (
-                    "-- Review row-by-row package logic and convert to set-based SQL or batch processing\n"
-                    "-- Consider FORALL or MERGE style rewrites where applicable"
-                ),
+                "message": message,
+                "hint_sql": _build_plsql_rpc_hint_sql(row),
             }
         )
     if (
@@ -1799,10 +2002,7 @@ def build_recommendations(row, slowdown_threshold):
             {
                 "rule_id": "PLAN-MISS",
                 "message": "Plan acquisition cost is high and plan cache does not appear to be hit",
-                "hint_sql": (
-                    "-- Refresh statistics, normalize SQL text, and inspect plan cache churn\n"
-                    "-- Consider plan binding or outline stabilization for hot statements"
-                ),
+                "hint_sql": _build_plan_miss_hint_sql(row),
             }
         )
     if queue_execute_ratio is not None and queue_execute_ratio > 3.0 and float(row.get("ob_retry_cnt") or 0.0) > 0.0:
@@ -2116,7 +2316,7 @@ def probe_oracle_capabilities(config):
         "awr": False,
         "vsql": False,
         "unified_audit": False,
-        "wcr": False,
+        "wcr": bool(str(config.settings.get("wcr_path") or "").strip()),
         "sql_file": True,
     }
     if oracledb is None or not config.oracle_source:
@@ -2256,6 +2456,209 @@ def capture_from_sql_file(config, sql_file, run_id):
         )
     workload_path = build_artifact_path("workload", run_id, root_dir=config.settings["workloads_dir"])
     append_jsonl(workload_path, workload_rows)
+    return workload_path
+
+
+def _capture_from_unified_audit(connection, config):
+    # type: (Any, AppConfig) -> List[Dict[str, Any]]
+    schemas = config.settings["source_schemas"]
+    placeholders, binds = _oracle_schema_placeholders("schema", schemas)
+    binds.update({"hours": int(config.settings["hours"]), "top_n": int(config.settings["top_n"])})
+    query = """
+        SELECT * FROM (
+          SELECT
+            SQL_TEXT,
+            DBUSERNAME,
+            COUNT(*) AS EXECUTIONS,
+            TO_CHAR(MAX(EVENT_TIMESTAMP), 'YYYY-MM-DD"T"HH24:MI:SS') AS CAPTURED_AT
+          FROM UNIFIED_AUDIT_TRAIL
+          WHERE DBUSERNAME IN ({placeholders})
+            AND SQL_TEXT IS NOT NULL
+            AND EVENT_TIMESTAMP >= SYSTIMESTAMP - NUMTODSINTERVAL(:hours, 'HOUR')
+          GROUP BY SQL_TEXT, DBUSERNAME
+          ORDER BY EXECUTIONS DESC, CAPTURED_AT DESC
+        ) WHERE ROWNUM <= :top_n
+    """.format(placeholders=placeholders)
+    cursor = connection.cursor()
+    cursor.execute(query, binds)
+    rows = []
+    for row in cursor:
+        sql_text = _coerce_jsonable(row[0])
+        sql_id = compute_sql_id(sql_text)
+        rows.append(
+            {
+                "sql_id": sql_id,
+                "sql_text": sql_text,
+                "sql_text_normalized": normalize_sql_text(sql_text),
+                "bind_vars": {},
+                "schema": _coerce_jsonable(row[1]),
+                "source": "unified_audit",
+                "captured_at": _coerce_jsonable(row[3]) or utc_now_iso(),
+                "baseline_source_mode": SOURCE_DB_MODE_ORACLE,
+                "baseline_avg_elapsed_us": None,
+                "baseline_avg_logical_reads": None,
+                "oracle_executions": int(row[2]) if row[2] is not None else 0,
+                "oracle_avg_elapsed_us": None,
+                "oracle_avg_cpu_us": None,
+                "oracle_avg_logical_reads": None,
+                "oracle_avg_physical_reads": None,
+                "oracle_plan_hash": None,
+                "oracle_plan_rows": [],
+            }
+        )
+    cursor.close()
+    return rows
+
+
+def _normalize_wcr_item(item, default_schema):
+    # type: (Dict[str, Any], str) -> Optional[Dict[str, Any]]
+    sql_text = _coerce_jsonable(
+        item.get("sql_text") or item.get("sql") or item.get("statement") or item.get("query")
+    )
+    if not str(sql_text or "").strip():
+        return None
+    captured_at = _coerce_jsonable(item.get("captured_at") or item.get("timestamp") or utc_now_iso())
+    schema_name = _coerce_jsonable(item.get("schema") or item.get("parsing_schema") or default_schema)
+    executions = _safe_int(item.get("executions") or item.get("execution_count") or 1) or 1
+    avg_elapsed = _safe_float(item.get("avg_elapsed_us") or item.get("elapsed_us"))
+    avg_logical_reads = _safe_float(item.get("avg_logical_reads") or item.get("logical_reads"))
+    avg_physical_reads = _safe_float(item.get("avg_physical_reads") or item.get("physical_reads"))
+    plan_hash = _coerce_jsonable(item.get("oracle_plan_hash") or item.get("plan_hash"))
+    return {
+        "sql_id": _coerce_jsonable(item.get("sql_id")) or compute_sql_id(sql_text),
+        "sql_text": sql_text,
+        "sql_text_normalized": normalize_sql_text(sql_text),
+        "bind_vars": item.get("bind_vars") or {},
+        "schema": schema_name,
+        "source": "wcr",
+        "captured_at": captured_at,
+        "baseline_source_mode": SOURCE_DB_MODE_ORACLE,
+        "baseline_avg_elapsed_us": avg_elapsed,
+        "baseline_avg_logical_reads": avg_logical_reads,
+        "oracle_executions": executions,
+        "oracle_avg_elapsed_us": avg_elapsed,
+        "oracle_avg_cpu_us": _safe_float(item.get("avg_cpu_us")),
+        "oracle_avg_logical_reads": avg_logical_reads,
+        "oracle_avg_physical_reads": avg_physical_reads,
+        "oracle_plan_hash": plan_hash,
+        "oracle_plan_rows": item.get("oracle_plan_rows") or [],
+    }
+
+
+def _parse_wcr_json_payload(payload_text, default_schema):
+    # type: (str, str) -> List[Dict[str, Any]]
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        items = payload.get("statements") or payload.get("rows") or payload.get("items") or []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return []
+    rows = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_wcr_item(item, default_schema)
+        if normalized:
+            rows.append(normalized)
+    return rows
+
+
+def _parse_wcr_jsonl_payload(payload_text, default_schema):
+    # type: (str, str) -> List[Dict[str, Any]]
+    rows = []
+    for line in str(payload_text or "").splitlines():
+        raw_line = line.strip()
+        if not raw_line:
+            continue
+        try:
+            item = json.loads(raw_line)
+        except Exception:
+            return []
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_wcr_item(item, default_schema)
+        if normalized:
+            rows.append(normalized)
+    return rows
+
+
+def _parse_wcr_xml_payload(payload_text, default_schema):
+    # type: (str, str) -> List[Dict[str, Any]]
+    try:
+        root = ET.fromstring(payload_text)
+    except Exception:
+        return []
+    rows = []
+    candidate_nodes = root.findall(".//statement") + root.findall(".//sql")
+    for node in candidate_nodes:
+        item = {
+            "sql_text": (node.findtext("sql_text") or node.findtext("text") or node.text or "").strip(),
+            "schema": (node.findtext("schema") or node.findtext("dbusername") or default_schema),
+            "captured_at": node.findtext("captured_at") or node.findtext("timestamp") or utc_now_iso(),
+            "executions": node.findtext("executions") or "1",
+        }
+        normalized = _normalize_wcr_item(item, default_schema)
+        if normalized:
+            rows.append(normalized)
+    return rows
+
+
+def parse_wcr_payload(payload_text, default_schema):
+    # type: (str, str) -> List[Dict[str, Any]]
+    payload_text = str(payload_text or "")
+    parsers = [
+        _parse_wcr_json_payload,
+        _parse_wcr_jsonl_payload,
+        _parse_wcr_xml_payload,
+    ]
+    for parser in parsers:
+        rows = parser(payload_text, default_schema)
+        if rows:
+            return rows
+    rows = []
+    for statement in split_sql_text(payload_text):
+        statement = statement.strip()
+        if not statement:
+            continue
+        rows.append(
+            {
+                "sql_id": compute_sql_id(statement),
+                "sql_text": statement,
+                "sql_text_normalized": normalize_sql_text(statement),
+                "bind_vars": {},
+                "schema": default_schema,
+                "source": "wcr",
+                "captured_at": utc_now_iso(),
+                "baseline_source_mode": SOURCE_DB_MODE_ORACLE,
+                "baseline_avg_elapsed_us": None,
+                "baseline_avg_logical_reads": None,
+                "oracle_executions": 1,
+                "oracle_avg_elapsed_us": None,
+                "oracle_avg_cpu_us": None,
+                "oracle_avg_logical_reads": None,
+                "oracle_avg_physical_reads": None,
+                "oracle_plan_hash": None,
+                "oracle_plan_rows": [],
+            }
+        )
+    return rows
+
+
+def capture_from_wcr_file(config, wcr_path, run_id):
+    # type: (AppConfig, str, str) -> Path
+    path = Path(str(wcr_path or "")).expanduser()
+    if not path.exists():
+        raise ConfigError("WCR file does not exist: %s" % str(path))
+    payload_text = path.read_text(encoding="utf-8", errors="ignore")
+    rows = parse_wcr_payload(payload_text, config.settings["source_schemas"][0])
+    if not rows:
+        raise ConfigError("WCR input did not produce any SQL statements: %s" % str(path))
+    workload_path = build_artifact_path("workload", run_id, root_dir=config.settings["workloads_dir"])
+    append_jsonl(workload_path, rows)
     return workload_path
 
 
@@ -2686,22 +3089,30 @@ def capture_workload(config, args, run_id):
         return capture_workload_from_ob_source(config, args, run_id)
     capture_capabilities = probe_oracle_capabilities(config)
     capture_capabilities["run_id"] = run_id
-    capture_capabilities["oracle_dsn"] = config.oracle_source["dsn"]
+    if config.oracle_source:
+        capture_capabilities["oracle_dsn"] = config.oracle_source.get("dsn")
     replay_capabilities = probe_replay_capabilities(config)
     replay_capabilities["run_id"] = run_id
     write_capability_files(config, run_id, capture_capabilities, replay_capabilities)
     if getattr(args, "sql_file", None):
         return capture_from_sql_file(config, args.sql_file, run_id)
+    wcr_path = str(getattr(args, "wcr_path", None) or config.settings.get("wcr_path") or "").strip()
     if capture_capabilities.get("awr"):
         preferred_source = "awr"
     elif capture_capabilities.get("vsql"):
         preferred_source = "vsql"
+    elif capture_capabilities.get("unified_audit"):
+        preferred_source = "unified_audit"
+    elif wcr_path and capture_capabilities.get("wcr"):
+        return capture_from_wcr_file(config, wcr_path, run_id)
     else:
         raise ConfigError("Oracle capture is unavailable and --sql-file was not provided")
     connection = _open_oracle_connection(config)
     try:
         if preferred_source == "awr":
             rows = _capture_from_awr(connection, config)
+        elif preferred_source == "unified_audit":
+            rows = _capture_from_unified_audit(connection, config)
         else:
             rows = _capture_from_vsql(connection, config)
     finally:
@@ -3294,6 +3705,142 @@ def _format_ratio(value):
     return "%.3f" % value
 
 
+def _render_svg_distribution_chart(rows, chart_id):
+    # type: (List[Dict[str, Any]], str) -> str
+    buckets = [
+        ("Accelerated", "#2f855a", 0),
+        ("Neutral", "#718096", 0),
+        ("Mild Regression", "#dd6b20", 0),
+        ("Severe Regression", "#c53030", 0),
+        ("Failed", "#4a5568", 0),
+    ]
+    mutable = [list(item) for item in buckets]
+    for row in rows:
+        if row.get("ob_status") != "ok":
+            mutable[4][2] += 1
+            continue
+        ratio = row.get("speedup_ratio")
+        if ratio is None:
+            mutable[1][2] += 1
+        elif ratio >= 1.05:
+            mutable[0][2] += 1
+        elif ratio >= 0.95:
+            mutable[1][2] += 1
+        elif ratio >= 0.5:
+            mutable[2][2] += 1
+        else:
+            mutable[3][2] += 1
+    total = max(1, sum(item[2] for item in mutable))
+    center_x = 90.0
+    center_y = 90.0
+    radius = 62.0
+    legend_y = 24
+    angle_start = -90.0
+    path_fragments = []
+    legend_fragments = []
+    for idx, (label, color, count) in enumerate(mutable):
+        fraction = float(count) / float(total)
+        sweep = 360.0 * fraction
+        angle_end = angle_start + sweep
+        large_arc = 1 if sweep > 180.0 else 0
+        start_x = center_x + radius * math.cos(math.radians(angle_start))
+        start_y = center_y + radius * math.sin(math.radians(angle_start))
+        end_x = center_x + radius * math.cos(math.radians(angle_end))
+        end_y = center_y + radius * math.sin(math.radians(angle_end))
+        if count > 0:
+            path_fragments.append(
+                '<path d="M {cx:.1f} {cy:.1f} L {sx:.1f} {sy:.1f} A {r:.1f} {r:.1f} 0 {arc} 1 {ex:.1f} {ey:.1f} Z" fill="{fill}"></path>'.format(
+                    cx=center_x,
+                    cy=center_y,
+                    sx=start_x,
+                    sy=start_y,
+                    r=radius,
+                    arc=large_arc,
+                    ex=end_x,
+                    ey=end_y,
+                    fill=color,
+                )
+            )
+        legend_fragments.append(
+            '<g transform="translate(210,{y})"><rect width="12" height="12" fill="{fill}"></rect><text x="18" y="10" font-size="12">{label}: {count}</text></g>'.format(
+                y=legend_y + idx * 22,
+                fill=color,
+                label=html.escape(label),
+                count=count,
+            )
+        )
+        angle_start = angle_end
+    return (
+        '<section id="overview-charts"><h2>Overview Charts</h2>'
+        '<div id="{chart_id}" class="chart-block">'
+        '<h3>Regression Distribution</h3>'
+        '<svg viewBox="0 0 420 190" role="img" aria-label="distribution chart">'
+        '{paths}<circle cx="90" cy="90" r="28" fill="#fff"></circle>'
+        '{legend}</svg></div>'
+    ).format(chart_id=chart_id, paths="".join(path_fragments), legend="".join(legend_fragments))
+
+
+def _render_svg_timing_chart(rows, chart_id, source_only=False):
+    # type: (List[Dict[str, Any]], str, bool) -> str
+    selected = rows[: min(8, len(rows))]
+    if not selected:
+        return ""
+    chart_width = 440
+    chart_height = 48 + len(selected) * 32
+    max_value = 1.0
+    for row in selected:
+        max_value = max(
+            max_value,
+            float(row.get("ob_elapsed_us") or 0.0),
+            float(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us") or 0.0),
+            float(row.get("source_total_elapsed_us") or 0.0),
+        )
+    bar_max_width = 220.0
+    fragments = []
+    for idx, row in enumerate(selected):
+        y = 28 + idx * 32
+        label = html.escape(str(row.get("sql_id")))
+        if source_only:
+            left_value = float(row.get("source_total_elapsed_us") or 0.0)
+            right_value = float(row.get("ob_elapsed_us") or 0.0)
+            left_label = "Total"
+            right_label = "Avg"
+        else:
+            left_value = float(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us") or 0.0)
+            right_value = float(row.get("ob_elapsed_us") or 0.0)
+            left_label = "Oracle"
+            right_label = "OB"
+        left_width = (left_value / max_value) * bar_max_width
+        right_width = (right_value / max_value) * bar_max_width
+        fragments.append(
+            '<text x="8" y="{y}" font-size="11">{label}</text>'
+            '<rect x="120" y="{y1}" width="{lw:.1f}" height="10" fill="#3182ce"></rect>'
+            '<rect x="120" y="{y2}" width="{rw:.1f}" height="10" fill="#dd6b20"></rect>'
+            '<text x="{lx:.1f}" y="{y1t}" font-size="10">{ll}:{lv:.0f}</text>'
+            '<text x="{rx:.1f}" y="{y2t}" font-size="10">{rl}:{rv:.0f}</text>'.format(
+                y=y,
+                label=label,
+                y1=y - 10,
+                y2=y + 4,
+                lw=left_width,
+                rw=right_width,
+                lx=126 + left_width,
+                rx=126 + right_width,
+                y1t=y - 2,
+                y2t=y + 14,
+                ll=left_label,
+                lv=left_value,
+                rl=right_label,
+                rv=right_value,
+            )
+        )
+    return (
+        '<div id="{chart_id}" class="chart-block"><h3>Timing Comparison</h3>'
+        '<svg viewBox="0 0 {width} {height}" role="img" aria-label="timing chart">{content}</svg></div>'
+        '</section>'
+    ).format(chart_id=chart_id, width=chart_width, height=chart_height, content="".join(fragments))
+
+
 def generate_report_from_replay(config, replay_path, run_id, workload_path=None):
     # type: (AppConfig, Union[str, Path], str, Optional[Union[str, Path]]) -> Dict[str, Path]
     replay_rows = read_jsonl(replay_path)
@@ -3394,6 +3941,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 sql=html.escape(str(row.get("sql_text") or "")),
             )
         )
+    charts_html = _render_svg_distribution_chart(enriched_rows, "distribution-chart")
+    charts_html += _render_svg_timing_chart(selected_rows, "timing-chart", source_only=False)
     html_content = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>perf_comparator report</title>
 <style>
@@ -3402,13 +3951,16 @@ table { border-collapse: collapse; width: 100%%; }
 th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
 th { background: #f4f4f4; text-align: left; }
 pre { white-space: pre-wrap; margin: 0; }
+.chart-block { margin-bottom: 20px; }
+svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 </style></head><body>
 <h1>perf_comparator report</h1>
 <p>Run ID: %s</p>
+%s
 <table>
 <thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Baseline Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
 <tbody>%s</tbody></table></body></html>
-""" % (html.escape(run_id), "".join(html_rows))
+""" % (html.escape(run_id), charts_html, "".join(html_rows))
     write_text(html_path, html_content)
 
     hints_lines = ["-- perf_comparator recommendations", "-- run_id: %s" % run_id, ""]
@@ -3555,6 +4107,8 @@ def generate_report_from_source_workload(config, workload_path, run_id):
                 sql=html.escape(build_sql_preview(row.get("sql_text"), limit=400)),
             )
         )
+    charts_html = _render_svg_distribution_chart(enriched_rows, "source-distribution-chart")
+    charts_html += _render_svg_timing_chart(selected_rows, "source-timing-chart", source_only=True)
     html_content = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>perf_comparator source report</title>
 <style>
@@ -3563,14 +4117,17 @@ table { border-collapse: collapse; width: 100%%; }
 th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
 th { background: #f4f4f4; text-align: left; }
 pre { white-space: pre-wrap; margin: 0; }
+ .chart-block { margin-bottom: 20px; }
+ svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 </style></head><body>
 <h1>perf_comparator source-only report</h1>
 <p>Run ID: %s</p>
 <p>Mode: source-only</p>
+%s
 <table>
 <thead><tr><th>SQL ID</th><th>Samples</th><th>Avg Elapsed (us)</th><th>Total Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
 <tbody>%s</tbody></table></body></html>
-""" % (html.escape(run_id), "".join(html_rows))
+""" % (html.escape(run_id), charts_html, "".join(html_rows))
     write_text(html_path, html_content)
 
     hints_lines = ["-- perf_comparator source-only recommendations", "-- run_id: %s" % run_id, ""]
@@ -3955,6 +4512,7 @@ def build_argument_parser():
     parser.add_argument("--workload", help="Input workload JSONL for replay-only mode")
     parser.add_argument("--replay", help="Input replay JSONL for report-only mode")
     parser.add_argument("--sql-file", help="Input SQL file for manual capture in batch mode")
+    parser.add_argument("--wcr-path", help="Input WCR export file for Oracle workload capture")
     parser.add_argument("--duration", type=int, default=None, help="Stream mode duration in seconds")
     parser.add_argument(
         "--verify-results",
@@ -4050,6 +4608,7 @@ def apply_cli_overrides(config, args):
         "slowdown_threshold": args.slowdown_threshold,
         "interval": args.interval,
         "audit_poll_ms": args.audit_poll_ms,
+        "wcr_path": getattr(args, "wcr_path", None),
     }
     for key, value in overrides.items():
         if value is not None:
