@@ -10,6 +10,13 @@ port = 2883
 user_string = app@test#obcluster
 password = your_source_oceanbase_password
 
+[OCEANBASE_SOURCE_SYS]
+executable = /usr/bin/obclient
+host = 127.0.0.2
+port = 2883
+user_string = SYS@sys#obcluster
+password = your_source_sys_password
+
 [OCEANBASE_TARGET]
 executable = /usr/bin/obclient
 host = 127.0.0.1
@@ -33,3 +40,9 @@ obclient_timeout = 120
 ob_session_query_timeout_us = 3600000000
 timeout_factor = 3.0
 slowdown_threshold = 0.8
+
+# Notes:
+# - Use [OCEANBASE_SOURCE] for OceanBase source capture.
+# - Use [OCEANBASE_SOURCE_SYS] for source-only diagnosis when ordinary users cannot
+#   read QUERY_SQL from GV$OB_SQL_AUDIT on OB 4.2.5.
+# - source-report mode may omit [ORACLE_SOURCE] and [OCEANBASE_TARGET].

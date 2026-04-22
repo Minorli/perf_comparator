@@ -46,6 +46,16 @@ perf_comparator runtime setup
   - password
   - used when [SETTINGS].source_db_mode = oceanbase
 
+- Optional OceanBase source diagnostic connection:
+  - [OCEANBASE_SOURCE_SYS]
+  - executable
+  - host
+  - port
+  - user_string
+  - password
+  - recommended for `source-report` on OB 4.2.5 when ordinary users cannot read `QUERY_SQL`
+  - normally use a privileged account such as `SYS@...`
+
 - Example starting point:
   - config.ini.template
 
@@ -80,3 +90,14 @@ perf_comparator runtime setup
 
 - `stream`
   - Oracle source only in the current implementation
+
+- `source-report`
+  - single OceanBase troubleshooting mode, no Oracle comparison and no target replay
+  - requires:
+    - `[SETTINGS].source_db_mode = oceanbase`
+    - `[OCEANBASE_SOURCE]`
+  - recommended:
+    - `[OCEANBASE_SOURCE_SYS]` for SQL text backfill on OB 4.2.5
+  - example:
+    - python3 perf_comparator.py --mode source-report --config config.ini --duration 900
+  - when SQL text is hidden from ordinary users, the summary and hints will show a coverage note and recommend enabling `_enable_sql_audit_query_sql=true`

@@ -179,6 +179,72 @@ class PerfComparatorConfigTests(unittest.TestCase):
             self.assertEqual(cfg.settings["source_db_mode"], "oceanbase")
             self.assertEqual(cfg.oracle_source, {})
 
+    def test_load_config_allows_source_only_ob_mode_without_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = app@test#obcluster
+                    password = source_secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(
+                str(config_path), execution_mode=perf_comparator.MODE_SOURCE_REPORT
+            )
+
+            self.assertEqual(cfg.settings["source_db_mode"], "oceanbase")
+            self.assertEqual(cfg.oceanbase_target, {})
+
+    def test_load_config_parses_optional_ob_source_sys_section(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = app@test#obcluster
+                    password = source_secret
+
+                    [OCEANBASE_SOURCE_SYS]
+                    executable = /bin/echo
+                    host = 127.0.0.2
+                    port = 2883
+                    user_string = SYS@ob4ora#observer147
+                    password = sys_secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(
+                str(config_path), execution_mode=perf_comparator.MODE_SOURCE_REPORT
+            )
+
+            self.assertEqual(
+                cfg.oceanbase_source_sys["user_string"], "SYS@ob4ora#observer147"
+            )
+
 
 class PerfComparatorUtilityTests(unittest.TestCase):
     def test_parse_oracle_dsn(self):
@@ -252,6 +318,60 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["net_ratio"], 0.25)
         self.assertTrue(metrics["plan_changed"])
 
+    def test_backfill_source_workload_sql_texts_uses_source_sys_connection(self):
+        config = perf_comparator.AppConfig(
+            oracle_source={},
+            oceanbase_source={
+                "executable": "/bin/echo",
+                "host": "127.0.0.2",
+                "port": "2883",
+                "user_string": "app@test#obcluster",
+                "password": "source_secret",
+            },
+            oceanbase_target={},
+            settings={"source_db_mode": "oceanbase", "source_schemas": ["APP"]},
+            config_path="config.ini",
+            oceanbase_source_sys={
+                "executable": "/bin/echo",
+                "host": "127.0.0.2",
+                "port": "2883",
+                "user_string": "SYS@ob4ora#observer147",
+                "password": "sys_secret",
+            },
+        )
+        rows = [
+            {
+                "sql_id": "sql-1",
+                "sql_text": "NULL",
+                "sql_text_normalized": "NULL",
+                "schema": "APP",
+            }
+        ]
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            return_value=(
+                True,
+                "sql-1\tSELECT /* recovered */ * FROM orders",
+                "",
+            ),
+        ) as obclient_mock:
+            enriched_rows, stats = perf_comparator.backfill_source_workload_sql_texts(
+                config, rows
+            )
+
+        obclient_mock.assert_called_once()
+        self.assertEqual(
+            obclient_mock.call_args[0][0]["user_string"], "SYS@ob4ora#observer147"
+        )
+        self.assertEqual(
+            enriched_rows[0]["sql_text"], "SELECT /* recovered */ * FROM orders"
+        )
+        self.assertEqual(enriched_rows[0]["source_sql_text_status"], "backfilled")
+        self.assertEqual(stats["backfilled"], 1)
+        self.assertEqual(stats["lookup_user"], "SYS@ob4ora#observer147")
+
     def test_build_recommendations_marks_slow_regression(self):
         row = {
             "sql_id": "sql-1",
@@ -273,8 +393,8 @@ class PerfComparatorUtilityTests(unittest.TestCase):
 
     def test_parse_ob_audit_rows_into_workload_events(self):
         stdout = (
-            "101\ttrace-1\tsql-1\t1200\t30\t20\t1150\t800\t20\t3\t1\t1\t90\t4\tSELECT * FROM orders\n"
-            "102\ttrace-2\tsql-2\t600\t10\t10\t580\t100\t5\t1\t1\t0\t20\t1\tBEGIN pkg.run(); END"
+            "101\ttrace-1\tsql-1\t1200\t30\t20\t1150\t800\t20\t3\t1\t1\t0\t2\t11\t90\t700\t50\t12\t4\tSELECT * FROM orders\n"
+            "102\ttrace-2\tsql-2\t600\t10\t10\t580\t100\t5\t1\t1\t0\t1\t0\t2\t20\t10\t2\t5\t1\tBEGIN pkg.run(); END"
         )
         rows = perf_comparator.parse_ob_audit_rows(stdout, "APP", captured_at="2026-04-22T15:00:00Z")
         self.assertEqual(len(rows), 2)
@@ -282,6 +402,9 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["source"], "ob_sql_audit")
         self.assertEqual(rows[0]["baseline_source_mode"], "oceanbase")
         self.assertEqual(rows[0]["oracle_avg_elapsed_us"], 1200.0)
+        self.assertEqual(rows[0]["source_ob_retry_cnt"], 2.0)
+        self.assertEqual(rows[0]["source_ob_memstore_read_rows"], 700.0)
+        self.assertEqual(rows[0]["source_ob_block_cache_hit"], 90.0)
         self.assertEqual(rows[1]["sql_text"], "BEGIN pkg.run(); END")
 
     def test_parse_explain_plan_text_extracts_plan_rows(self):
@@ -359,6 +482,200 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         }
         signals = perf_comparator.build_plan_diff_signals(row)
         self.assertTrue(any(item["signal_id"] == "LOOKUP-RISK" for item in signals))
+
+    def test_aggregate_source_workload_rows_preserves_hotspot_signals(self):
+        rows = [
+            {
+                "sql_id": "sql-1",
+                "sql_text": "SELECT * FROM orders",
+                "sql_text_normalized": "SELECT * FROM ORDERS",
+                "baseline_avg_elapsed_us": 1000.0,
+                "oracle_avg_elapsed_us": 1000.0,
+                "oracle_avg_logical_reads": 100.0,
+                "oracle_avg_physical_reads": 10.0,
+                "source_ob_queue_time_us": 200.0,
+                "source_ob_get_plan_time_us": 100.0,
+                "source_ob_execute_time_us": 700.0,
+                "source_ob_net_time_us": 650.0,
+                "source_ob_net_wait_time_us": 20.0,
+                "source_ob_plan_type_raw": "3",
+                "source_ob_is_hit_plan": "0",
+                "source_ob_is_executor_rpc": "1",
+                "source_ob_retry_cnt": 1.0,
+                "source_ob_memstore_read_rows": 400.0,
+                "source_ob_ssstore_read_rows": 100.0,
+                "source_ob_bloom_filter_filtered": 0.0,
+                "source_ob_trace_id": "trace-1",
+                "source_ob_request_id": "100",
+            },
+            {
+                "sql_id": "sql-1",
+                "sql_text": "SELECT * FROM orders",
+                "sql_text_normalized": "SELECT * FROM ORDERS",
+                "baseline_avg_elapsed_us": 2000.0,
+                "oracle_avg_elapsed_us": 2000.0,
+                "oracle_avg_logical_reads": 120.0,
+                "oracle_avg_physical_reads": 12.0,
+                "source_ob_queue_time_us": 300.0,
+                "source_ob_get_plan_time_us": 300.0,
+                "source_ob_execute_time_us": 1400.0,
+                "source_ob_net_time_us": 1300.0,
+                "source_ob_net_wait_time_us": 40.0,
+                "source_ob_plan_type_raw": "3",
+                "source_ob_is_hit_plan": "0",
+                "source_ob_is_executor_rpc": "1",
+                "source_ob_retry_cnt": 2.0,
+                "source_ob_memstore_read_rows": 500.0,
+                "source_ob_ssstore_read_rows": 100.0,
+                "source_ob_bloom_filter_filtered": 0.0,
+                "source_ob_trace_id": "trace-2",
+                "source_ob_request_id": "101",
+            },
+        ]
+        aggregated = perf_comparator.aggregate_ob_source_workload_rows(rows)
+        self.assertEqual(len(aggregated), 1)
+        row = aggregated[0]
+        self.assertEqual(row["source_sample_count"], 2)
+        self.assertEqual(row["ob_plan_type_raw"], "3")
+        self.assertAlmostEqual(row["ob_elapsed_us"], 1500.0)
+        self.assertAlmostEqual(row["net_ratio"], 1950.0 / 3000.0)
+        self.assertEqual(row["source_ob_trace_id"], "trace-2")
+
+    def test_aggregate_source_workload_rows_supports_snapshot_execution_counts(self):
+        rows = [
+            {
+                "sql_id": "sqlstat-1",
+                "sql_text": "SELECT /* from sqlstat */ 1 FROM dual",
+                "sql_text_normalized": "SELECT /* FROM SQLSTAT */ 1 FROM DUAL",
+                "source_execution_count": 5,
+                "source_total_elapsed_us": 5000.0,
+                "baseline_avg_elapsed_us": 1000.0,
+                "oracle_avg_elapsed_us": 1000.0,
+                "oracle_avg_logical_reads": 50.0,
+                "oracle_avg_physical_reads": 5.0,
+                "source_ob_logical_reads": 50.0,
+                "source_ob_physical_reads": 5.0,
+                "source_ob_queue_time_us": 0.0,
+                "source_ob_get_plan_time_us": 50.0,
+                "source_ob_execute_time_us": 950.0,
+                "source_ob_net_time_us": 100.0,
+                "source_ob_net_wait_time_us": 0.0,
+                "source_ob_plan_type_raw": "1",
+                "source_ob_is_hit_plan": "1",
+                "source_ob_is_executor_rpc": "0",
+                "source_ob_retry_cnt": 0.0,
+                "source_ob_memstore_read_rows": 20.0,
+                "source_ob_ssstore_read_rows": 5.0,
+                "source_ob_trace_id": None,
+                "source_ob_request_id": None,
+            }
+        ]
+
+        aggregated = perf_comparator.aggregate_ob_source_workload_rows(rows)
+
+        self.assertEqual(len(aggregated), 1)
+        row = aggregated[0]
+        self.assertEqual(row["source_sample_count"], 5)
+        self.assertAlmostEqual(row["source_total_elapsed_us"], 5000.0)
+        self.assertAlmostEqual(row["ob_elapsed_us"], 1000.0)
+
+    def test_build_source_sqlstat_delta_rows_emits_missing_sql_ids(self):
+        start_snapshot = {
+            "sql-keep": {
+                "sql_id": "sql-keep",
+                "query_sql": "SELECT 1 FROM dual",
+                "plan_type": "1",
+                "executions_total": 10.0,
+                "elapsed_time_total": 10000.0,
+                "buffer_gets_total": 500.0,
+                "disk_reads_total": 50.0,
+                "memstore_read_rows_total": 100.0,
+                "minor_ssstore_read_rows_total": 20.0,
+                "major_ssstore_read_rows_total": 30.0,
+                "rpc_total": 0.0,
+                "retry_total": 0.0,
+                "plan_cache_hit_total": 10.0,
+            }
+        }
+        end_snapshot = {
+            "sql-keep": {
+                "sql_id": "sql-keep",
+                "query_sql": "SELECT 1 FROM dual",
+                "plan_type": "1",
+                "executions_total": 12.0,
+                "elapsed_time_total": 12000.0,
+                "buffer_gets_total": 520.0,
+                "disk_reads_total": 52.0,
+                "memstore_read_rows_total": 110.0,
+                "minor_ssstore_read_rows_total": 21.0,
+                "major_ssstore_read_rows_total": 31.0,
+                "rpc_total": 0.0,
+                "retry_total": 0.0,
+                "plan_cache_hit_total": 12.0,
+            },
+            "sql-new": {
+                "sql_id": "sql-new",
+                "query_sql": "SELECT /* sqlstat supplement */ * FROM orders",
+                "plan_type": "3",
+                "executions_total": 4.0,
+                "elapsed_time_total": 4000.0,
+                "buffer_gets_total": 600.0,
+                "disk_reads_total": 40.0,
+                "memstore_read_rows_total": 200.0,
+                "minor_ssstore_read_rows_total": 30.0,
+                "major_ssstore_read_rows_total": 10.0,
+                "rpc_total": 4.0,
+                "retry_total": 2.0,
+                "plan_cache_hit_total": 0.0,
+            },
+        }
+
+        rows = perf_comparator.build_source_sqlstat_delta_rows(
+            start_snapshot,
+            end_snapshot,
+            captured_sql_ids={"sql-keep"},
+            default_schema="APP",
+            captured_at="2026-04-22T18:40:00Z",
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["sql_id"], "sql-new")
+        self.assertEqual(row["source_execution_count"], 4)
+        self.assertAlmostEqual(row["source_total_elapsed_us"], 4000.0)
+        self.assertEqual(row["source_ob_plan_type_raw"], "3")
+        self.assertEqual(row["source_ob_is_executor_rpc"], "1")
+        self.assertEqual(row["source_ob_is_hit_plan"], "0")
+
+    def test_build_source_plan_cache_recent_rows_emits_missing_sql_ids(self):
+        recent_rows = [
+            {
+                "sql_id": "sql-pc",
+                "query_sql": "SELECT /* plan cache supplement */ * FROM invoices",
+                "avg_exe_usec": 4200.0,
+                "executions": 3.0,
+                "elapsed_time": 12600.0,
+                "buffer_gets": 300.0,
+                "disk_reads": 12.0,
+                "hit_count": 3.0,
+                "type": "3",
+                "table_scan": 1.0,
+            }
+        ]
+
+        rows = perf_comparator.build_source_plan_cache_recent_rows(
+            recent_rows,
+            captured_sql_ids={"other-sql"},
+            default_schema="APP",
+            captured_at="2026-04-22T18:50:00Z",
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["sql_id"], "sql-pc")
+        self.assertEqual(row["source"], "ob_plan_cache_recent")
+        self.assertEqual(row["source_execution_count"], 1)
+        self.assertAlmostEqual(row["source_total_elapsed_us"], 4200.0)
 
     def test_build_recommendations_handles_plan_miss_lock_hot_and_plsql(self):
         row = {
@@ -1333,6 +1650,248 @@ class PerfComparatorCliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             verify_mock.assert_called_once()
+
+    def test_source_report_mode_runs_with_only_ob_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            workloads_dir = Path(tmpdir) / "workloads"
+            report_dir = Path(tmpdir) / "reports"
+            workload_path = workloads_dir / "workload_20260422_180000.jsonl"
+            workloads_dir.mkdir(parents=True, exist_ok=True)
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "sql_text_normalized": "SELECT * FROM ORDERS",
+                    "baseline_avg_elapsed_us": 1200.0,
+                    "oracle_avg_elapsed_us": 1200.0,
+                    "oracle_avg_logical_reads": 90.0,
+                    "oracle_avg_physical_reads": 4.0,
+                    "source_ob_queue_time_us": 30.0,
+                    "source_ob_get_plan_time_us": 20.0,
+                    "source_ob_execute_time_us": 1150.0,
+                    "source_ob_net_time_us": 800.0,
+                    "source_ob_net_wait_time_us": 20.0,
+                    "source_ob_plan_type_raw": "3",
+                    "source_ob_is_hit_plan": "1",
+                    "source_ob_is_executor_rpc": "1",
+                    "source_ob_retry_cnt": 1.0,
+                    "source_ob_memstore_read_rows": 300.0,
+                    "source_ob_ssstore_read_rows": 100.0,
+                    "source_ob_bloom_filter_filtered": 0.0,
+                    "source_ob_trace_id": "trace-1",
+                    "source_ob_request_id": "100",
+                },
+            )
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [OCEANBASE_SOURCE]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_db_mode = oceanbase
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    duration = 1
+                    interval = 1
+                    """
+                ).strip().format(workloads_dir=workloads_dir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "capture_workload_from_ob_source",
+                return_value=workload_path,
+            ):
+                exit_code = perf_comparator.main(
+                    ["--mode", "source-report", "--config", str(config_path)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            summary_files = list(report_dir.glob("perf_report_*_summary.txt"))
+            self.assertEqual(len(summary_files), 1)
+            summary_text = summary_files[0].read_text(encoding="utf-8")
+            self.assertIn("Report Mode: source-only", summary_text)
+            self.assertIn("sql-1", summary_text)
+
+    def test_generate_source_report_summary_mentions_sql_text_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_180000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "NULL",
+                    "sql_text_normalized": "NULL",
+                    "baseline_avg_elapsed_us": 1200.0,
+                    "oracle_avg_elapsed_us": 1200.0,
+                    "oracle_avg_logical_reads": 90.0,
+                    "oracle_avg_physical_reads": 4.0,
+                    "source_ob_queue_time_us": 30.0,
+                    "source_ob_get_plan_time_us": 20.0,
+                    "source_ob_execute_time_us": 1150.0,
+                    "source_ob_net_time_us": 800.0,
+                    "source_ob_net_wait_time_us": 20.0,
+                    "source_ob_plan_type_raw": "3",
+                    "source_ob_is_hit_plan": "1",
+                    "source_ob_is_executor_rpc": "1",
+                    "source_ob_retry_cnt": 1.0,
+                    "source_ob_memstore_read_rows": 300.0,
+                    "source_ob_ssstore_read_rows": 100.0,
+                    "source_ob_trace_id": "trace-1",
+                    "source_ob_request_id": "100",
+                },
+            )
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.2",
+                    "port": "2883",
+                    "user_string": "app@test#obcluster",
+                    "password": "source_secret",
+                },
+                oceanbase_target={},
+                settings={
+                    "source_db_mode": "oceanbase",
+                    "source_schemas": ["APP"],
+                    "report_dir": str(report_dir),
+                    "slowdown_threshold": 0.8,
+                    "top_n": 20,
+                },
+                config_path="config.ini",
+                oceanbase_source_sys={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.2",
+                    "port": "2883",
+                    "user_string": "SYS@ob4ora#observer147",
+                    "password": "sys_secret",
+                },
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "lookup_source_sql_texts",
+                return_value={},
+            ), mock.patch.object(
+                perf_comparator,
+                "collect_source_plan_monitor_rows",
+                return_value=[],
+            ):
+                report_paths = perf_comparator.generate_report_from_source_workload(
+                    config, workload_path, "20260422_180000"
+                )
+
+            summary_text = report_paths["summary"].read_text(encoding="utf-8")
+            self.assertIn("SQL text coverage:", summary_text)
+            self.assertIn("OCEANBASE_SOURCE_SYS", summary_text)
+            self.assertIn("_enable_sql_audit_query_sql", summary_text)
+
+    def test_generate_source_report_skips_internal_perf_queries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_180100.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                [
+                    {
+                        "sql_id": "internal-1",
+                        "sql_text": "NULL",
+                        "sql_text_normalized": "NULL",
+                        "baseline_avg_elapsed_us": 5000.0,
+                        "oracle_avg_elapsed_us": 5000.0,
+                        "oracle_avg_logical_reads": 10.0,
+                        "oracle_avg_physical_reads": 1.0,
+                        "source_ob_queue_time_us": 0.0,
+                        "source_ob_get_plan_time_us": 0.0,
+                        "source_ob_execute_time_us": 5000.0,
+                        "source_ob_net_time_us": 0.0,
+                        "source_ob_net_wait_time_us": 0.0,
+                        "source_ob_plan_type_raw": "1",
+                        "source_ob_is_hit_plan": "1",
+                        "source_ob_is_executor_rpc": "0",
+                        "source_ob_retry_cnt": 0.0,
+                        "source_ob_memstore_read_rows": 0.0,
+                        "source_ob_ssstore_read_rows": 0.0,
+                    },
+                    {
+                        "sql_id": "user-1",
+                        "sql_text": "NULL",
+                        "sql_text_normalized": "NULL",
+                        "baseline_avg_elapsed_us": 1000.0,
+                        "oracle_avg_elapsed_us": 1000.0,
+                        "oracle_avg_logical_reads": 10.0,
+                        "oracle_avg_physical_reads": 1.0,
+                        "source_ob_queue_time_us": 0.0,
+                        "source_ob_get_plan_time_us": 0.0,
+                        "source_ob_execute_time_us": 1000.0,
+                        "source_ob_net_time_us": 0.0,
+                        "source_ob_net_wait_time_us": 0.0,
+                        "source_ob_plan_type_raw": "1",
+                        "source_ob_is_hit_plan": "1",
+                        "source_ob_is_executor_rpc": "0",
+                        "source_ob_retry_cnt": 0.0,
+                        "source_ob_memstore_read_rows": 0.0,
+                        "source_ob_ssstore_read_rows": 0.0,
+                    },
+                ],
+            )
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.2",
+                    "port": "2883",
+                    "user_string": "app@test#obcluster",
+                    "password": "source_secret",
+                },
+                oceanbase_target={},
+                settings={
+                    "source_db_mode": "oceanbase",
+                    "source_schemas": ["APP"],
+                    "report_dir": str(report_dir),
+                    "slowdown_threshold": 0.8,
+                    "top_n": 20,
+                },
+                config_path="config.ini",
+                oceanbase_source_sys={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.2",
+                    "port": "2883",
+                    "user_string": "SYS@ob4ora#observer147",
+                    "password": "sys_secret",
+                },
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "lookup_source_sql_texts",
+                return_value={
+                    "internal-1": "SELECT /* perf_comparator_source_poll */ * FROM GV$OB_SQL_AUDIT",
+                    "user-1": "SELECT /* user workload */ * FROM orders",
+                },
+            ), mock.patch.object(
+                perf_comparator,
+                "collect_source_plan_monitor_rows",
+                return_value=[],
+            ):
+                report_paths = perf_comparator.generate_report_from_source_workload(
+                    config, workload_path, "20260422_180100"
+                )
+
+            summary_text = report_paths["summary"].read_text(encoding="utf-8")
+            self.assertIn("user workload", summary_text)
+            self.assertNotIn("perf_comparator_source_poll", summary_text)
 
 
 if __name__ == "__main__":

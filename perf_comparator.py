@@ -34,6 +34,7 @@ MODE_STREAM = "stream"
 MODE_REPLAY_ONLY = "replay-only"
 MODE_REPORT_ONLY = "report-only"
 MODE_CHECK_CONFIG = "check-config"
+MODE_SOURCE_REPORT = "source-report"
 MODE_VERIFY_REALDB = "verify-realdb"
 
 DEFAULT_WORKLOADS_DIR = "workloads"
@@ -52,6 +53,7 @@ DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT = 1
 
 SECTION_ORACLE_SOURCE = "ORACLE_SOURCE"
 SECTION_OCEANBASE_SOURCE = "OCEANBASE_SOURCE"
+SECTION_OCEANBASE_SOURCE_SYS = "OCEANBASE_SOURCE_SYS"
 SECTION_OCEANBASE_TARGET = "OCEANBASE_TARGET"
 SECTION_SETTINGS = "SETTINGS"
 
@@ -123,6 +125,7 @@ class AppConfig:
     oceanbase_target: Dict[str, str]
     settings: Dict[str, Any]
     config_path: str
+    oceanbase_source_sys: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -393,8 +396,8 @@ def _get_optional_float(section, key, default_value):
         raise ConfigError("[%s] must be a number" % key)
 
 
-def load_config(config_path):
-    # type: (str) -> AppConfig
+def load_config(config_path, execution_mode=None):
+    # type: (str, Optional[str]) -> AppConfig
     parser = configparser.ConfigParser(
         interpolation=None, inline_comment_prefixes=("#", ";")
     )
@@ -420,7 +423,15 @@ def load_config(config_path):
     oceanbase_source = {}
     if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
         oceanbase_source = _load_ob_section(parser, SECTION_OCEANBASE_SOURCE)
-    oceanbase_target = _load_ob_section(parser, SECTION_OCEANBASE_TARGET)
+    oceanbase_source_sys = {}
+    if parser.has_section(SECTION_OCEANBASE_SOURCE_SYS):
+        oceanbase_source_sys = _load_ob_section(parser, SECTION_OCEANBASE_SOURCE_SYS)
+    oceanbase_target = {}
+    requires_target = execution_mode != MODE_SOURCE_REPORT
+    if parser.has_section(SECTION_OCEANBASE_TARGET):
+        oceanbase_target = _load_ob_section(parser, SECTION_OCEANBASE_TARGET)
+    elif requires_target:
+        raise ConfigError("config.ini missing [%s] section" % SECTION_OCEANBASE_TARGET)
 
     source_schemas = normalize_schema_list(settings_section.get("source_schemas", ""))
     if not source_schemas:
@@ -477,6 +488,7 @@ def load_config(config_path):
         oceanbase_target=oceanbase_target,
         settings=settings,
         config_path=str(config_path),
+        oceanbase_source_sys=oceanbase_source_sys,
     )
 
 
@@ -582,6 +594,46 @@ def normalize_sql_text(sql_text):
     return collapsed.upper()
 
 
+def is_missing_sql_text(sql_text):
+    # type: (Any) -> bool
+    normalized = normalize_sql_text(sql_text)
+    return normalized in ("", "NULL", "NONE")
+
+
+def build_sql_preview(sql_text, limit=160):
+    # type: (Any, int) -> str
+    if is_missing_sql_text(sql_text):
+        return "<SQL text unavailable>"
+    collapsed = re.sub(r"\s+", " ", str(sql_text or "")).strip()
+    if len(collapsed) <= int(limit):
+        return collapsed
+    return collapsed[: max(1, int(limit) - 3)].rstrip() + "..."
+
+
+def is_internal_perf_comparator_source_sql(sql_text):
+    # type: (Any) -> bool
+    normalized = normalize_sql_text(sql_text)
+    if "PERF_COMPARATOR_SOURCE_" in normalized:
+        return True
+    patterns = (
+        "SELECT REQUEST_ID, TRACE_ID, SQL_ID, ELAPSED_TIME",
+        "SELECT NVL(MAX(REQUEST_ID)",
+        "SELECT SQL_ID, PLAN_TYPE, REPLACE(REPLACE(REPLACE(QUERY_SQL",
+        "SELECT SQL_ID, REPLACE(REPLACE(REPLACE(QUERY_SQL",
+    )
+    if "FROM GV$OB_SQL_AUDIT" in normalized and any(
+        pattern in normalized for pattern in patterns[:2]
+    ):
+        return True
+    if "FROM GV$OB_SQLSTAT" in normalized and any(
+        pattern in normalized for pattern in patterns[2:]
+    ):
+        return True
+    if "FROM GV$OB_PLAN_CACHE_PLAN_STAT" in normalized and patterns[3] in normalized:
+        return True
+    return False
+
+
 def compute_sql_id(sql_text):
     # type: (str) -> str
     return hashlib.sha1(normalize_sql_text(sql_text).encode("utf-8")).hexdigest()[:16]
@@ -649,8 +701,23 @@ def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
         fields = line.split("\t")
         if len(fields) < 15:
             continue
-        sql_id = fields[2] or compute_sql_id(fields[14])
-        sql_text = fields[14]
+        format_kind = "legacy"
+        if len(fields) >= 21:
+            format_kind = "source425"
+        elif len(fields) >= 19:
+            format_kind = "rich"
+        retry_idx = 13 if format_kind == "source425" else (12 if format_kind == "rich" else None)
+        table_scan_idx = 12 if format_kind == "source425" else None
+        row_cache_hit_idx = 14 if format_kind == "source425" else None
+        block_cache_hit_idx = 15 if format_kind == "source425" else None
+        memstore_idx = 16 if format_kind == "source425" else (13 if format_kind == "rich" else None)
+        ssstore_idx = 17 if format_kind == "source425" else (14 if format_kind == "rich" else None)
+        bloom_idx = 15 if format_kind == "rich" else None
+        logical_idx = 18 if format_kind == "source425" else (16 if format_kind == "rich" else 12)
+        physical_idx = 19 if format_kind == "source425" else (17 if format_kind == "rich" else 13)
+        sql_text_idx = 20 if format_kind == "source425" else (18 if format_kind == "rich" else 14)
+        sql_id = fields[2] or compute_sql_id(fields[sql_text_idx])
+        sql_text = fields[sql_text_idx]
         rows.append(
             {
                 "sql_id": sql_id,
@@ -662,12 +729,12 @@ def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
                 "captured_at": stamped_at,
                 "baseline_source_mode": SOURCE_DB_MODE_OCEANBASE,
                 "baseline_avg_elapsed_us": _safe_float(fields[3]),
-                "baseline_avg_logical_reads": _safe_float(fields[12]),
+                "baseline_avg_logical_reads": _safe_float(fields[logical_idx]),
                 "oracle_executions": 1,
                 "oracle_avg_elapsed_us": _safe_float(fields[3]),
                 "oracle_avg_cpu_us": None,
-                "oracle_avg_logical_reads": _safe_float(fields[12]),
-                "oracle_avg_physical_reads": _safe_float(fields[13]),
+                "oracle_avg_logical_reads": _safe_float(fields[logical_idx]),
+                "oracle_avg_physical_reads": _safe_float(fields[physical_idx]),
                 "oracle_plan_hash": fields[9] or None,
                 "oracle_plan_rows": [],
                 "source_ob_request_id": fields[0],
@@ -677,10 +744,452 @@ def parse_ob_audit_rows(stdout_text, default_schema, captured_at=None):
                 "source_ob_execute_time_us": _safe_float(fields[6]),
                 "source_ob_net_time_us": _safe_float(fields[7]),
                 "source_ob_net_wait_time_us": _safe_float(fields[8]),
+                "source_ob_table_scan": _safe_float(fields[table_scan_idx]) if table_scan_idx is not None else None,
                 "source_ob_plan_type_raw": fields[9],
                 "source_ob_plan_type": PLAN_TYPE_NAMES.get(str(fields[9]), str(fields[9])),
                 "source_ob_is_hit_plan": fields[10],
                 "source_ob_is_executor_rpc": fields[11],
+                "source_ob_retry_cnt": _safe_float(fields[retry_idx]) if retry_idx is not None else None,
+                "source_ob_row_cache_hit": _safe_float(fields[row_cache_hit_idx]) if row_cache_hit_idx is not None else None,
+                "source_ob_block_cache_hit": _safe_float(fields[block_cache_hit_idx]) if block_cache_hit_idx is not None else None,
+                "source_ob_memstore_read_rows": _safe_float(fields[memstore_idx]) if memstore_idx is not None else None,
+                "source_ob_ssstore_read_rows": _safe_float(fields[ssstore_idx]) if ssstore_idx is not None else None,
+                "source_ob_bloom_filter_filtered": _safe_float(fields[bloom_idx]) if bloom_idx is not None else None,
+                "source_ob_logical_reads": _safe_float(fields[logical_idx]),
+                "source_ob_physical_reads": _safe_float(fields[physical_idx]),
+            }
+        )
+    return rows
+
+
+def get_source_sql_lookup_ob_cfg(config):
+    # type: (AppConfig) -> Dict[str, str]
+    if config.oceanbase_source_sys:
+        return config.oceanbase_source_sys
+    return config.oceanbase_source
+
+
+def _build_source_sql_text_lookup_query(view_name, sql_ids):
+    # type: (str, Sequence[str]) -> str
+    escaped_ids = []
+    for sql_id in sql_ids:
+        raw_sql_id = str(sql_id or "").strip()
+        if not raw_sql_id:
+            continue
+        escaped_ids.append("'%s'" % raw_sql_id.replace("'", "''"))
+    if not escaped_ids:
+        return ""
+    return """
+        SELECT /* perf_comparator_source_sql_lookup */
+          SQL_ID,
+          REPLACE(REPLACE(REPLACE(QUERY_SQL, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ')
+        FROM {view_name}
+        WHERE QUERY_SQL IS NOT NULL
+          AND SQL_ID IN ({sql_ids})
+        ORDER BY SQL_ID
+    """.format(view_name=view_name, sql_ids=", ".join(escaped_ids))
+
+
+def _parse_source_sql_text_lookup_rows(stdout_text):
+    # type: (str) -> Dict[str, str]
+    mapping = {}
+    for line in (stdout_text or "").splitlines():
+        fields = line.split("\t", 1)
+        if len(fields) < 2:
+            continue
+        sql_id = str(fields[0] or "").strip()
+        sql_text = str(fields[1] or "").strip()
+        if not sql_id or is_missing_sql_text(sql_text) or sql_id in mapping:
+            continue
+        mapping[sql_id] = sql_text
+    return mapping
+
+
+def lookup_source_sql_texts(config, sql_ids):
+    # type: (AppConfig, Sequence[str]) -> Dict[str, str]
+    ob_cfg = get_source_sql_lookup_ob_cfg(config)
+    if not ob_cfg:
+        return {}
+    pending_ids = []
+    seen = set()
+    for sql_id in sql_ids:
+        raw_sql_id = str(sql_id or "").strip()
+        if not raw_sql_id or raw_sql_id in seen:
+            continue
+        seen.add(raw_sql_id)
+        pending_ids.append(raw_sql_id)
+    if not pending_ids:
+        return {}
+
+    resolved = {}  # type: Dict[str, str]
+    view_names = [
+        "GV$OB_SQLSTAT",
+        "GV$OB_PLAN_CACHE_PLAN_STAT",
+        "GV$OB_SQL_AUDIT",
+    ]
+    batch_size = 50
+    for start_idx in range(0, len(pending_ids), batch_size):
+        batch_ids = pending_ids[start_idx : start_idx + batch_size]
+        unresolved = list(batch_ids)
+        for view_name in view_names:
+            if not unresolved:
+                break
+            query = _build_source_sql_text_lookup_query(view_name, unresolved)
+            if not query:
+                continue
+            ok, stdout, _ = obclient_run_sql(
+                ob_cfg,
+                query,
+                timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+                session_query_timeout_us=config.settings.get(
+                    "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+                ),
+            )
+            if not ok or not stdout.strip():
+                continue
+            resolved.update(_parse_source_sql_text_lookup_rows(stdout))
+            unresolved = [sql_id for sql_id in unresolved if sql_id not in resolved]
+    return resolved
+
+
+def backfill_source_workload_sql_texts(config, workload_rows):
+    # type: (AppConfig, List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
+    lookup_cfg = get_source_sql_lookup_ob_cfg(config)
+    missing_sql_ids = []
+    for row in workload_rows:
+        if is_missing_sql_text(row.get("sql_text")):
+            sql_id = str(row.get("sql_id") or "").strip()
+            if sql_id:
+                missing_sql_ids.append(sql_id)
+    lookup_map = lookup_source_sql_texts(config, missing_sql_ids) if missing_sql_ids else {}
+    stats = {
+        "captured": 0,
+        "backfilled": 0,
+        "missing": 0,
+        "lookup_user": str(lookup_cfg.get("user_string") or ""),
+        "using_source_sys": bool(config.oceanbase_source_sys),
+    }
+    enriched_rows = []
+    for row in workload_rows:
+        updated = dict(row)
+        sql_id = str(updated.get("sql_id") or "").strip()
+        raw_sql_text = updated.get("sql_text")
+        if is_missing_sql_text(raw_sql_text):
+            recovered_sql_text = lookup_map.get(sql_id, "")
+            if recovered_sql_text:
+                updated["sql_text"] = recovered_sql_text
+                updated["sql_text_normalized"] = normalize_sql_text(recovered_sql_text)
+                updated["source_sql_text_status"] = "backfilled"
+                stats["backfilled"] += 1
+            else:
+                updated["sql_text"] = ""
+                updated["sql_text_normalized"] = ""
+                updated["source_sql_text_status"] = "missing"
+                stats["missing"] += 1
+        else:
+            sql_text = str(raw_sql_text)
+            updated["sql_text"] = sql_text
+            updated["sql_text_normalized"] = (
+                updated.get("sql_text_normalized") or normalize_sql_text(sql_text)
+            )
+            updated["source_sql_text_status"] = "captured"
+            stats["captured"] += 1
+        enriched_rows.append(updated)
+    return enriched_rows, stats
+
+
+def _parse_source_sqlstat_snapshot_rows(stdout_text):
+    # type: (str) -> Dict[str, Dict[str, Any]]
+    snapshot = {}
+    for line in (stdout_text or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 14:
+            continue
+        sql_id = str(fields[0] or "").strip()
+        if not sql_id:
+            continue
+        snapshot[sql_id] = {
+            "sql_id": sql_id,
+            "plan_type": fields[1],
+            "query_sql": fields[2],
+            "executions_total": _safe_float(fields[3]) or 0.0,
+            "elapsed_time_total": _safe_float(fields[4]) or 0.0,
+            "buffer_gets_total": _safe_float(fields[5]) or 0.0,
+            "disk_reads_total": _safe_float(fields[6]) or 0.0,
+            "memstore_read_rows_total": _safe_float(fields[7]) or 0.0,
+            "minor_ssstore_read_rows_total": _safe_float(fields[8]) or 0.0,
+            "major_ssstore_read_rows_total": _safe_float(fields[9]) or 0.0,
+            "rpc_total": _safe_float(fields[10]) or 0.0,
+            "retry_total": _safe_float(fields[11]) or 0.0,
+            "plan_cache_hit_total": _safe_float(fields[12]) or 0.0,
+            "plan_hash": fields[13] or None,
+        }
+    return snapshot
+
+
+def collect_source_sqlstat_snapshot(config):
+    # type: (AppConfig) -> Dict[str, Dict[str, Any]]
+    query = """
+        SELECT /* perf_comparator_source_sqlstat_snapshot */
+          SQL_ID,
+          PLAN_TYPE,
+          REPLACE(REPLACE(REPLACE(QUERY_SQL, CHR(10), ' '), CHR(13), ' '), CHR(9), ' '),
+          EXECUTIONS_TOTAL,
+          ELAPSED_TIME_TOTAL,
+          BUFFER_GETS_TOTAL,
+          DISK_READS_TOTAL,
+          MEMSTORE_READ_ROWS_TOTAL,
+          MINOR_SSSTORE_READ_ROWS_TOTAL,
+          MAJOR_SSSTORE_READ_ROWS_TOTAL,
+          RPC_TOTAL,
+          RETRY_TOTAL,
+          PLAN_CACHE_HIT_TOTAL,
+          PLAN_HASH
+        FROM GV$OB_SQLSTAT
+    """
+    ok, stdout, _ = _obclient_run_sql_on_source(
+        config,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return {}
+    return _parse_source_sqlstat_snapshot_rows(stdout)
+
+
+def build_source_sqlstat_delta_rows(
+    start_snapshot,
+    end_snapshot,
+    captured_sql_ids,
+    default_schema,
+    captured_at,
+):
+    # type: (Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Iterable[str], str, str) -> List[Dict[str, Any]]
+    captured_sql_id_set = set(str(sql_id) for sql_id in (captured_sql_ids or []) if sql_id)
+    rows = []
+    for sql_id, end_entry in end_snapshot.items():
+        if sql_id in captured_sql_id_set:
+            continue
+        start_entry = start_snapshot.get(sql_id, {})
+        executions_delta = max(
+            0.0,
+            float(end_entry.get("executions_total") or 0.0)
+            - float(start_entry.get("executions_total") or 0.0),
+        )
+        elapsed_delta = max(
+            0.0,
+            float(end_entry.get("elapsed_time_total") or 0.0)
+            - float(start_entry.get("elapsed_time_total") or 0.0),
+        )
+        if executions_delta <= 0.0 or elapsed_delta <= 0.0:
+            continue
+        logical_delta = max(
+            0.0,
+            float(end_entry.get("buffer_gets_total") or 0.0)
+            - float(start_entry.get("buffer_gets_total") or 0.0),
+        )
+        physical_delta = max(
+            0.0,
+            float(end_entry.get("disk_reads_total") or 0.0)
+            - float(start_entry.get("disk_reads_total") or 0.0),
+        )
+        memstore_delta = max(
+            0.0,
+            float(end_entry.get("memstore_read_rows_total") or 0.0)
+            - float(start_entry.get("memstore_read_rows_total") or 0.0),
+        )
+        minor_delta = max(
+            0.0,
+            float(end_entry.get("minor_ssstore_read_rows_total") or 0.0)
+            - float(start_entry.get("minor_ssstore_read_rows_total") or 0.0),
+        )
+        major_delta = max(
+            0.0,
+            float(end_entry.get("major_ssstore_read_rows_total") or 0.0)
+            - float(start_entry.get("major_ssstore_read_rows_total") or 0.0),
+        )
+        rpc_delta = max(
+            0.0,
+            float(end_entry.get("rpc_total") or 0.0)
+            - float(start_entry.get("rpc_total") or 0.0),
+        )
+        retry_delta = max(
+            0.0,
+            float(end_entry.get("retry_total") or 0.0)
+            - float(start_entry.get("retry_total") or 0.0),
+        )
+        plan_hit_delta = max(
+            0.0,
+            float(end_entry.get("plan_cache_hit_total") or 0.0)
+            - float(start_entry.get("plan_cache_hit_total") or 0.0),
+        )
+        avg_elapsed_us = elapsed_delta / executions_delta
+        avg_logical_reads = logical_delta / executions_delta
+        avg_physical_reads = physical_delta / executions_delta
+        avg_memstore_reads = memstore_delta / executions_delta
+        avg_ssstore_reads = (minor_delta + major_delta) / executions_delta
+        avg_retry_cnt = retry_delta / executions_delta
+        rows.append(
+            {
+                "sql_id": sql_id,
+                "sql_text": end_entry.get("query_sql") or "",
+                "sql_text_normalized": normalize_sql_text(end_entry.get("query_sql") or ""),
+                "bind_vars": {},
+                "schema": default_schema,
+                "source": "ob_sqlstat_snapshot",
+                "captured_at": captured_at,
+                "baseline_source_mode": SOURCE_DB_MODE_OCEANBASE,
+                "baseline_avg_elapsed_us": avg_elapsed_us,
+                "baseline_avg_logical_reads": avg_logical_reads,
+                "oracle_executions": int(executions_delta),
+                "oracle_avg_elapsed_us": avg_elapsed_us,
+                "oracle_avg_logical_reads": avg_logical_reads,
+                "oracle_avg_physical_reads": avg_physical_reads,
+                "oracle_plan_hash": end_entry.get("plan_hash"),
+                "oracle_plan_rows": [],
+                "source_execution_count": int(executions_delta),
+                "source_total_elapsed_us": elapsed_delta,
+                "source_ob_request_id": None,
+                "source_ob_trace_id": None,
+                "source_ob_queue_time_us": 0.0,
+                "source_ob_get_plan_time_us": 0.0,
+                "source_ob_execute_time_us": avg_elapsed_us,
+                "source_ob_net_time_us": 0.0,
+                "source_ob_net_wait_time_us": 0.0,
+                "source_ob_plan_type_raw": end_entry.get("plan_type"),
+                "source_ob_plan_type": PLAN_TYPE_NAMES.get(
+                    str(end_entry.get("plan_type") or ""), str(end_entry.get("plan_type") or "")
+                ),
+                "source_ob_is_hit_plan": "1" if plan_hit_delta > 0.0 else "0",
+                "source_ob_is_executor_rpc": "1" if rpc_delta > 0.0 else "0",
+                "source_ob_retry_cnt": avg_retry_cnt,
+                "source_ob_memstore_read_rows": avg_memstore_reads,
+                "source_ob_ssstore_read_rows": avg_ssstore_reads,
+                "source_ob_bloom_filter_filtered": 0.0,
+                "source_ob_logical_reads": avg_logical_reads,
+                "source_ob_physical_reads": avg_physical_reads,
+            }
+        )
+    return rows
+
+
+def _parse_source_plan_cache_recent_rows(stdout_text):
+    # type: (str) -> List[Dict[str, Any]]
+    rows = []
+    for line in (stdout_text or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 10:
+            continue
+        sql_id = str(fields[0] or "").strip()
+        if not sql_id:
+            continue
+        rows.append(
+            {
+                "sql_id": sql_id,
+                "query_sql": fields[1],
+                "avg_exe_usec": _safe_float(fields[2]) or 0.0,
+                "executions": _safe_float(fields[3]) or 0.0,
+                "elapsed_time": _safe_float(fields[4]) or 0.0,
+                "buffer_gets": _safe_float(fields[5]) or 0.0,
+                "disk_reads": _safe_float(fields[6]) or 0.0,
+                "hit_count": _safe_float(fields[7]) or 0.0,
+                "type": fields[8],
+                "table_scan": _safe_float(fields[9]) or 0.0,
+            }
+        )
+    return rows
+
+
+def collect_source_plan_cache_recent_rows(config, window_start):
+    # type: (AppConfig, datetime) -> List[Dict[str, Any]]
+    started_at = window_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    query = """
+        SELECT /* perf_comparator_source_plan_cache_recent */
+          SQL_ID,
+          REPLACE(REPLACE(REPLACE(QUERY_SQL, CHR(10), ' '), CHR(13), ' '), CHR(9), ' '),
+          AVG_EXE_USEC,
+          EXECUTIONS,
+          ELAPSED_TIME,
+          BUFFERS_GETS,
+          DISK_READS,
+          HIT_COUNT,
+          TYPE,
+          TABLE_SCAN
+        FROM GV$OB_PLAN_CACHE_PLAN_STAT
+        WHERE QUERY_SQL IS NOT NULL
+          AND LAST_ACTIVE_TIME >= TO_TIMESTAMP('{started_at}', 'YYYY-MM-DD HH24:MI:SS')
+    """.format(started_at=started_at)
+    ok, stdout, _ = _obclient_run_sql_on_source(
+        config,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return []
+    return _parse_source_plan_cache_recent_rows(stdout)
+
+
+def build_source_plan_cache_recent_rows(recent_rows, captured_sql_ids, default_schema, captured_at):
+    # type: (List[Dict[str, Any]], Iterable[str], str, str) -> List[Dict[str, Any]]
+    captured_sql_id_set = set(str(sql_id) for sql_id in (captured_sql_ids or []) if sql_id)
+    rows = []
+    for recent_row in recent_rows:
+        sql_id = str(recent_row.get("sql_id") or "").strip()
+        if not sql_id or sql_id in captured_sql_id_set:
+            continue
+        avg_exe_usec = float(recent_row.get("avg_exe_usec") or 0.0)
+        if avg_exe_usec <= 0.0:
+            continue
+        query_sql = recent_row.get("query_sql") or ""
+        buffer_gets = float(recent_row.get("buffer_gets") or 0.0)
+        disk_reads = float(recent_row.get("disk_reads") or 0.0)
+        executions = max(1.0, float(recent_row.get("executions") or 1.0))
+        rows.append(
+            {
+                "sql_id": sql_id,
+                "sql_text": query_sql,
+                "sql_text_normalized": normalize_sql_text(query_sql),
+                "bind_vars": {},
+                "schema": default_schema,
+                "source": "ob_plan_cache_recent",
+                "captured_at": captured_at,
+                "baseline_source_mode": SOURCE_DB_MODE_OCEANBASE,
+                "baseline_avg_elapsed_us": avg_exe_usec,
+                "baseline_avg_logical_reads": buffer_gets / executions,
+                "oracle_executions": 1,
+                "oracle_avg_elapsed_us": avg_exe_usec,
+                "oracle_avg_logical_reads": buffer_gets / executions,
+                "oracle_avg_physical_reads": disk_reads / executions,
+                "oracle_plan_hash": None,
+                "oracle_plan_rows": [],
+                "source_execution_count": 1,
+                "source_total_elapsed_us": avg_exe_usec,
+                "source_ob_request_id": None,
+                "source_ob_trace_id": None,
+                "source_ob_queue_time_us": 0.0,
+                "source_ob_get_plan_time_us": 0.0,
+                "source_ob_execute_time_us": avg_exe_usec,
+                "source_ob_net_time_us": 0.0,
+                "source_ob_net_wait_time_us": 0.0,
+                "source_ob_plan_type_raw": recent_row.get("type"),
+                "source_ob_plan_type": PLAN_TYPE_NAMES.get(
+                    str(recent_row.get("type") or ""), str(recent_row.get("type") or "")
+                ),
+                "source_ob_is_hit_plan": "1" if float(recent_row.get("hit_count") or 0.0) > 0.0 else "0",
+                "source_ob_is_executor_rpc": "0",
+                "source_ob_retry_cnt": 0.0,
+                "source_ob_memstore_read_rows": 0.0,
+                "source_ob_ssstore_read_rows": 0.0,
+                "source_ob_bloom_filter_filtered": 0.0,
+                "source_ob_logical_reads": buffer_gets / executions,
+                "source_ob_physical_reads": disk_reads / executions,
+                "source_ob_table_scan": recent_row.get("table_scan"),
             }
         )
     return rows
@@ -886,6 +1395,47 @@ def collect_plan_monitor_rows(config, audit_row, rendered_sql):
     """.format(where_clause=where_clause)
     ok, stdout, _ = obclient_run_sql(
         config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok:
+        return []
+    return parse_plan_monitor_rows(stdout)
+
+
+def collect_source_plan_monitor_rows(config, row):
+    # type: (AppConfig, Dict[str, Any]) -> List[Dict[str, Any]]
+    trace_id = str(row.get("source_ob_trace_id") or row.get("trace_id") or "")
+    sql_text_snippet = normalize_sql_text(row.get("sql_text") or "")[:80].replace("'", "''")
+    filters = []
+    if trace_id:
+        filters.append("TRACE_ID = '%s'" % trace_id.replace("'", "''"))
+    if sql_text_snippet:
+        filters.append(
+            "UPPER(REPLACE(REPLACE(REPLACE(STATEMENT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ')) LIKE '%%%s%%'"
+            % sql_text_snippet
+        )
+    if not filters:
+        return []
+    query = """
+        SELECT * FROM (
+          SELECT
+            PLAN_LINE_ID,
+            OPERATOR,
+            OUTPUT_ROWS,
+            WORKAREA_MEM,
+            WORKAREA_MAX_MEM,
+            WORKAREA_TEMPSEG
+          FROM GV$SQL_PLAN_MONITOR
+          WHERE {where_clause}
+          ORDER BY PLAN_LINE_ID
+        )
+    """.format(where_clause=" OR ".join(filters))
+    ok, stdout, _ = _obclient_run_sql_on_source(
+        config,
         query,
         timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
         session_query_timeout_us=config.settings.get(
@@ -1471,15 +2021,16 @@ def validate_runtime_paths(config):
         except ConfigError as exc:
             result.errors.append(str(exc))
 
-    obclient_path = Path(config.oceanbase_target.get("executable", "")).expanduser()
-    if not obclient_path.exists():
-        result.errors.append(
-            "obclient executable not found: %s" % str(obclient_path)
-        )
-    elif not os.access(str(obclient_path), os.X_OK):
-        result.warnings.append(
-            "obclient executable exists but is not executable: %s" % str(obclient_path)
-        )
+    if config.oceanbase_target:
+        obclient_path = Path(config.oceanbase_target.get("executable", "")).expanduser()
+        if not obclient_path.exists():
+            result.errors.append(
+                "obclient executable not found: %s" % str(obclient_path)
+            )
+        elif not os.access(str(obclient_path), os.X_OK):
+            result.warnings.append(
+                "obclient executable exists but is not executable: %s" % str(obclient_path)
+            )
 
     if config.settings.get("source_db_mode") == SOURCE_DB_MODE_OCEANBASE:
         source_ob_path = Path(config.oceanbase_source.get("executable", "")).expanduser()
@@ -1489,6 +2040,19 @@ def validate_runtime_paths(config):
             result.warnings.append(
                 "source obclient executable exists but is not executable: %s" % str(source_ob_path)
             )
+        if config.oceanbase_source_sys:
+            source_sys_ob_path = Path(
+                config.oceanbase_source_sys.get("executable", "")
+            ).expanduser()
+            if not source_sys_ob_path.exists():
+                result.errors.append(
+                    "source SYS obclient executable not found: %s" % str(source_sys_ob_path)
+                )
+            elif not os.access(str(source_sys_ob_path), os.X_OK):
+                result.warnings.append(
+                    "source SYS obclient executable exists but is not executable: %s"
+                    % str(source_sys_ob_path)
+                )
 
     if oracledb is None and config.oracle_source:
         result.warnings.append(
@@ -1502,14 +2066,15 @@ def summarize_config(config):
     # type: (AppConfig) -> Dict[str, Any]
     summary = {
         "config_path": config.config_path,
-        "oceanbase_target": {
+        "settings": config.settings,
+    }
+    if config.oceanbase_target:
+        summary["oceanbase_target"] = {
             "executable": config.oceanbase_target["executable"],
             "host": config.oceanbase_target["host"],
             "port": config.oceanbase_target["port"],
             "user_string": config.oceanbase_target["user_string"],
-        },
-        "settings": config.settings,
-    }
+        }
     if config.oracle_source:
         host, port, service_name = parse_oracle_dsn(config.oracle_source["dsn"])
         summary["oracle_source"] = {
@@ -1524,6 +2089,13 @@ def summarize_config(config):
             "host": config.oceanbase_source["host"],
             "port": config.oceanbase_source["port"],
             "user_string": config.oceanbase_source["user_string"],
+        }
+    if config.oceanbase_source_sys:
+        summary["oceanbase_source_sys"] = {
+            "executable": config.oceanbase_source_sys["executable"],
+            "host": config.oceanbase_source_sys["host"],
+            "port": config.oceanbase_source_sys["port"],
+            "user_string": config.oceanbase_source_sys["user_string"],
         }
     return summary
 
@@ -1582,6 +2154,8 @@ def probe_oracle_capabilities(config):
 
 def probe_replay_capabilities(config):
     # type: (AppConfig) -> Dict[str, Any]
+    if not config.oceanbase_target:
+        return {"obclient": False, "sql_audit": False, "explain": False, "configured": False}
     ob_cfg = config.oceanbase_target
     capabilities = {
         "obclient": Path(ob_cfg["executable"]).exists(),
@@ -1641,8 +2215,8 @@ def write_capability_files(config, run_id, capture_capabilities=None, replay_cap
         replay_capabilities
         or {
             "run_id": run_id,
-            "obclient_executable": config.oceanbase_target["executable"],
-            "obclient_host": config.oceanbase_target["host"],
+            "obclient_executable": config.oceanbase_target.get("executable"),
+            "obclient_host": config.oceanbase_target.get("host"),
         },
     )
 
@@ -1866,7 +2440,7 @@ def _capture_from_awr(connection, config):
 def _build_source_ob_audit_query(last_request_id):
     # type: (int) -> str
     return """
-        SELECT
+        SELECT /* perf_comparator_source_poll */
           REQUEST_ID,
           TRACE_ID,
           SQL_ID,
@@ -1879,9 +2453,15 @@ def _build_source_ob_audit_query(last_request_id):
           PLAN_TYPE,
           IS_HIT_PLAN,
           IS_EXECUTOR_RPC,
-          LOGICAL_READ_COUNT,
-          PHYSICAL_READ_COUNT,
-          SQL_TEXT
+          TABLE_SCAN,
+          RETRY_CNT,
+          ROW_CACHE_HIT,
+          BLOCK_CACHE_HIT,
+          MEMSTORE_READ_ROW_COUNT,
+          SSSTORE_READ_ROW_COUNT,
+          RETURN_ROWS,
+          DISK_READS,
+          QUERY_SQL
         FROM GV$OB_SQL_AUDIT
         WHERE REQUEST_ID > {last_request_id}
         ORDER BY REQUEST_ID
@@ -1896,6 +2476,21 @@ def _obclient_run_sql_on_source(config, sql_text, timeout=None, session_query_ti
         timeout=timeout,
         session_query_timeout_us=session_query_timeout_us,
     )
+
+
+def get_source_max_request_id(config):
+    # type: (AppConfig) -> int
+    ok, stdout, _ = _obclient_run_sql_on_source(
+        config,
+        "SELECT /* perf_comparator_source_seed */ NVL(MAX(REQUEST_ID), 0) FROM GV$OB_SQL_AUDIT",
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok or not stdout.strip():
+        return 0
+    return int(_safe_int(stdout.splitlines()[0].split("\t")[0]) or 0)
 
 
 def capture_workload_from_ob_source(config, args, run_id):
@@ -1915,7 +2510,13 @@ def capture_workload_from_ob_source(config, args, run_id):
     duration = max(1, duration)
     poll_interval = max(1, int(config.settings.get("interval", DEFAULT_INTERVAL)))
     started = time.time()
+    window_started_at = datetime.now(timezone.utc)
     last_request_id = 0
+    captured_sql_ids = set()
+    source_sqlstat_start = {}
+    if getattr(args, "mode", None) == MODE_SOURCE_REPORT:
+        source_sqlstat_start = collect_source_sqlstat_snapshot(config)
+        last_request_id = get_source_max_request_id(config)
     default_schema = config.settings["source_schemas"][0]
     while True:
         ok, stdout, stderr = _obclient_run_sql_on_source(
@@ -1935,13 +2536,148 @@ def capture_workload_from_ob_source(config, args, run_id):
         rows = parse_ob_audit_rows(stdout, default_schema, captured_at=utc_now_iso())
         if rows:
             append_jsonl(workload_path, rows)
+            captured_sql_ids.update(str(row.get("sql_id") or "") for row in rows if row.get("sql_id"))
             last_request_id = max(int(row.get("source_ob_request_id") or 0) for row in rows)
         if time.time() - started >= duration:
             break
         time.sleep(poll_interval)
+    if getattr(args, "mode", None) == MODE_SOURCE_REPORT and source_sqlstat_start:
+        source_sqlstat_end = collect_source_sqlstat_snapshot(config)
+        sqlstat_rows = build_source_sqlstat_delta_rows(
+            source_sqlstat_start,
+            source_sqlstat_end,
+            captured_sql_ids=captured_sql_ids,
+            default_schema=default_schema,
+            captured_at=utc_now_iso(),
+        )
+        if sqlstat_rows:
+            append_jsonl(workload_path, sqlstat_rows)
+            captured_sql_ids.update(str(row.get("sql_id") or "") for row in sqlstat_rows if row.get("sql_id"))
+        plan_cache_recent = collect_source_plan_cache_recent_rows(config, window_started_at)
+        plan_cache_rows = build_source_plan_cache_recent_rows(
+            plan_cache_recent,
+            captured_sql_ids=captured_sql_ids,
+            default_schema=default_schema,
+            captured_at=utc_now_iso(),
+        )
+        if plan_cache_rows:
+            append_jsonl(workload_path, plan_cache_rows)
     if not workload_path.exists():
         raise ConfigError("OceanBase source capture did not produce any workload rows")
     return workload_path
+
+
+def aggregate_ob_source_workload_rows(workload_rows):
+    # type: (List[Dict[str, Any]]) -> List[Dict[str, Any]]
+    grouped = {}  # type: Dict[str, Dict[str, Any]]
+    for row in workload_rows:
+        sql_text = str(row.get("sql_text") or "")
+        sample_increment = max(1, int(_safe_int(row.get("source_execution_count")) or 1))
+        total_elapsed_us = _safe_float(row.get("source_total_elapsed_us"))
+        if total_elapsed_us is None:
+            total_elapsed_us = (
+                float(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us") or 0.0)
+                * sample_increment
+            )
+        key = str(row.get("sql_id") or compute_sql_id(sql_text))
+        entry = grouped.get(key)
+        if entry is None:
+            entry = {
+                "sql_id": key,
+                "sql_text": sql_text,
+                "sql_text_normalized": row.get("sql_text_normalized") or normalize_sql_text(sql_text),
+                "schema": row.get("schema"),
+                "source": "ob_source_report",
+                "ob_status": "ok",
+                "baseline_source_mode": SOURCE_DB_MODE_OCEANBASE,
+                "source_sample_count": 0,
+                "source_total_elapsed_us": 0.0,
+                "source_total_logical_reads": 0.0,
+                "source_total_physical_reads": 0.0,
+                "source_total_queue_time_us": 0.0,
+                "source_total_get_plan_time_us": 0.0,
+                "source_total_execute_time_us": 0.0,
+                "source_total_net_time_us": 0.0,
+                "source_total_net_wait_time_us": 0.0,
+                "source_total_retry_cnt": 0.0,
+                "source_total_memstore_read_rows": 0.0,
+                "source_total_ssstore_read_rows": 0.0,
+                "source_total_bloom_filter_filtered": 0.0,
+                "source_plan_miss_count": 0,
+                "source_rpc_count": 0,
+                "source_ob_trace_id": row.get("source_ob_trace_id"),
+                "source_ob_request_id": row.get("source_ob_request_id"),
+                "source_ob_plan_type_raw": row.get("source_ob_plan_type_raw"),
+                "captured_at": row.get("captured_at"),
+            }
+            grouped[key] = entry
+        entry["source_sample_count"] += sample_increment
+        entry["source_total_elapsed_us"] += float(total_elapsed_us or 0.0)
+        entry["source_total_logical_reads"] += float(
+            row.get("source_ob_logical_reads")
+            or row.get("baseline_avg_logical_reads")
+            or row.get("oracle_avg_logical_reads")
+            or 0.0
+        ) * sample_increment
+        entry["source_total_physical_reads"] += float(
+            row.get("source_ob_physical_reads") or row.get("oracle_avg_physical_reads") or 0.0
+        ) * sample_increment
+        entry["source_total_queue_time_us"] += float(row.get("source_ob_queue_time_us") or 0.0) * sample_increment
+        entry["source_total_get_plan_time_us"] += float(row.get("source_ob_get_plan_time_us") or 0.0) * sample_increment
+        entry["source_total_execute_time_us"] += float(row.get("source_ob_execute_time_us") or 0.0) * sample_increment
+        entry["source_total_net_time_us"] += float(row.get("source_ob_net_time_us") or 0.0) * sample_increment
+        entry["source_total_net_wait_time_us"] += float(row.get("source_ob_net_wait_time_us") or 0.0) * sample_increment
+        entry["source_total_retry_cnt"] += float(row.get("source_ob_retry_cnt") or 0.0) * sample_increment
+        entry["source_total_memstore_read_rows"] += float(row.get("source_ob_memstore_read_rows") or 0.0) * sample_increment
+        entry["source_total_ssstore_read_rows"] += float(row.get("source_ob_ssstore_read_rows") or 0.0) * sample_increment
+        entry["source_total_bloom_filter_filtered"] += float(row.get("source_ob_bloom_filter_filtered") or 0.0) * sample_increment
+        entry["source_plan_miss_count"] += 0 if _is_truthy_flag(row.get("source_ob_is_hit_plan")) else sample_increment
+        entry["source_rpc_count"] += sample_increment if _is_truthy_flag(row.get("source_ob_is_executor_rpc")) else 0
+        request_id = _safe_int(row.get("source_ob_request_id"))
+        current_request_id = _safe_int(entry.get("source_ob_request_id"))
+        if request_id is not None and (current_request_id is None or request_id >= current_request_id):
+            entry["source_ob_request_id"] = row.get("source_ob_request_id")
+            entry["source_ob_trace_id"] = row.get("source_ob_trace_id")
+            entry["source_ob_plan_type_raw"] = row.get("source_ob_plan_type_raw")
+            entry["captured_at"] = row.get("captured_at")
+
+    aggregated_rows = []
+    for entry in grouped.values():
+        sample_count = max(1, int(entry.get("source_sample_count") or 1))
+        aggregated = {
+            "sql_id": entry.get("sql_id"),
+            "sql_text": entry.get("sql_text"),
+            "sql_text_normalized": entry.get("sql_text_normalized"),
+            "schema": entry.get("schema"),
+            "source": entry.get("source"),
+            "captured_at": entry.get("captured_at"),
+            "baseline_source_mode": SOURCE_DB_MODE_OCEANBASE,
+            "ob_status": "ok",
+            "source_sample_count": sample_count,
+            "source_total_elapsed_us": entry.get("source_total_elapsed_us"),
+            "ob_elapsed_us": float(entry.get("source_total_elapsed_us") or 0.0) / sample_count,
+            "ob_queue_time_us": float(entry.get("source_total_queue_time_us") or 0.0) / sample_count,
+            "ob_get_plan_time_us": float(entry.get("source_total_get_plan_time_us") or 0.0) / sample_count,
+            "ob_execute_time_us": float(entry.get("source_total_execute_time_us") or 0.0) / sample_count,
+            "ob_net_time_us": float(entry.get("source_total_net_time_us") or 0.0) / sample_count,
+            "ob_net_wait_time_us": float(entry.get("source_total_net_wait_time_us") or 0.0) / sample_count,
+            "ob_plan_type_raw": entry.get("source_ob_plan_type_raw"),
+            "ob_is_hit_plan": "1" if int(entry.get("source_plan_miss_count") or 0) == 0 else "0",
+            "ob_is_executor_rpc": "1" if int(entry.get("source_rpc_count") or 0) > 0 else "0",
+            "ob_logical_reads": float(entry.get("source_total_logical_reads") or 0.0) / sample_count,
+            "ob_physical_reads": float(entry.get("source_total_physical_reads") or 0.0) / sample_count,
+            "ob_retry_cnt": float(entry.get("source_total_retry_cnt") or 0.0) / sample_count,
+            "ob_memstore_read_rows": float(entry.get("source_total_memstore_read_rows") or 0.0) / sample_count,
+            "ob_ssstore_read_rows": float(entry.get("source_total_ssstore_read_rows") or 0.0) / sample_count,
+            "ob_bloom_filter_filtered": float(entry.get("source_total_bloom_filter_filtered") or 0.0) / sample_count,
+            "source_ob_trace_id": entry.get("source_ob_trace_id"),
+            "source_ob_request_id": entry.get("source_ob_request_id"),
+            "plan_monitor_rows": [],
+        }
+        aggregated.update(derive_replay_metrics(aggregated))
+        aggregated["plan_diff_signals"] = []
+        aggregated_rows.append(aggregated)
+    return aggregated_rows
 
 
 def capture_workload(config, args, run_id):
@@ -2151,6 +2887,11 @@ def _safe_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _is_truthy_flag(value):
+    # type: (Any) -> bool
+    return str(value or "").strip() in ("1", "True", "true", "YES", "yes")
 
 
 def _escape_sql_string(value):
@@ -2697,21 +3438,193 @@ pre { white-space: pre-wrap; margin: 0; }
     return {"summary": summary_path, "html": html_path, "hints": hints_path}
 
 
+def generate_report_from_source_workload(config, workload_path, run_id):
+    # type: (AppConfig, Union[str, Path], str) -> Dict[str, Path]
+    workload_rows = read_jsonl(workload_path)
+    if not workload_rows:
+        raise ConfigError("Source workload file is empty: %s" % str(workload_path))
+    workload_rows, sql_text_stats = backfill_source_workload_sql_texts(config, workload_rows)
+    workload_rows = [
+        row
+        for row in workload_rows
+        if not is_internal_perf_comparator_source_sql(row.get("sql_text"))
+    ]
+    if not workload_rows:
+        raise ConfigError("Source workload only contained internal perf_comparator source queries")
+    enriched_rows = aggregate_ob_source_workload_rows(workload_rows)
+    if not enriched_rows:
+        raise ConfigError("Source workload did not produce any reportable rows")
+    visible_sql_stmt_count = sum(
+        1 for row in enriched_rows if not is_missing_sql_text(row.get("sql_text"))
+    )
+    missing_sql_stmt_count = max(0, len(enriched_rows) - visible_sql_stmt_count)
+    slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
+    for row in enriched_rows:
+        if should_collect_plan_monitor(row, slowdown_threshold):
+            try:
+                row["plan_monitor_rows"] = collect_source_plan_monitor_rows(config, row)
+            except Exception:
+                LOG.exception("Source plan monitor collection failed for sql_id=%s", row.get("sql_id"))
+                row["plan_monitor_rows"] = []
+        row["plan_diff_signals"] = build_plan_diff_signals(row)
+        row["plsql_profile_summary"] = summarize_plsql_profile(row)
+        row["recommendations"] = build_recommendations(row, slowdown_threshold=slowdown_threshold)
+
+    enriched_rows = sorted(
+        enriched_rows,
+        key=lambda item: (
+            -(float(item.get("source_total_elapsed_us") or 0.0)),
+            -(int(item.get("source_sample_count") or 0)),
+            -(float(item.get("ob_elapsed_us") or 0.0)),
+        ),
+    )
+    top_n = int(config.settings.get("top_n", DEFAULT_TOP_N))
+    selected_rows = enriched_rows[:top_n]
+    report_dir = Path(config.settings["report_dir"])
+    summary_path = build_artifact_path("report_summary", run_id, root_dir=report_dir)
+    html_path = build_artifact_path("report_html", run_id, root_dir=report_dir)
+    hints_path = build_artifact_path("report_hints", run_id, root_dir=report_dir)
+
+    summary_lines = [
+        "Run ID: %s" % run_id,
+        "Source workload file: %s" % str(workload_path),
+        "Report Mode: source-only",
+        "Total statements: %d" % len(enriched_rows),
+        "Captured samples: %d" % sum(int(row.get("source_sample_count") or 0) for row in enriched_rows),
+        "Distributed statements: %d" % sum(1 for row in enriched_rows if str(row.get("ob_plan_type_raw") or "") == "3"),
+        "SQL text coverage: %d/%d visible (row_backfilled=%d row_missing=%d via=%s)"
+        % (
+            visible_sql_stmt_count,
+            len(enriched_rows),
+            int(sql_text_stats.get("backfilled", 0)),
+            int(sql_text_stats.get("missing", 0)),
+            sql_text_stats.get("lookup_user") or "unconfigured",
+        ),
+        "",
+        "Top hotspots:",
+    ]
+    if missing_sql_stmt_count > 0:
+        summary_lines.append(
+            "SQL text note: ordinary users may not see QUERY_SQL on OB 4.2.5; configure [%s] and enable _enable_sql_audit_query_sql=true."
+            % SECTION_OCEANBASE_SOURCE_SYS
+        )
+        summary_lines.append("")
+    for idx, row in enumerate(selected_rows, 1):
+        rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
+        summary_lines.append(
+            "%d. sql_id=%s samples=%s avg_elapsed_us=%s total_elapsed_us=%s rules=%s monitor=%s plan_risk=%s"
+            % (
+                idx,
+                row.get("sql_id"),
+                row.get("source_sample_count"),
+                row.get("ob_elapsed_us"),
+                row.get("source_total_elapsed_us"),
+                rule_ids,
+                summarize_plan_monitor_evidence(row),
+                summarize_plan_diff_signals(row),
+            )
+        )
+        summary_lines.append("   sql: %s" % build_sql_preview(row.get("sql_text")))
+    write_text(summary_path, "\n".join(summary_lines) + "\n")
+
+    html_rows = []
+    for row in selected_rows:
+        html_rows.append(
+            "<tr><td>{sql_id}</td><td>{samples}</td><td>{avg_elapsed}</td><td>{total_elapsed}</td><td>{rules}</td><td>{evidence}</td><td><pre>{sql}</pre></td></tr>".format(
+                sql_id=html.escape(str(row.get("sql_id"))),
+                samples=html.escape(str(row.get("source_sample_count"))),
+                avg_elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+                total_elapsed=html.escape(str(row.get("source_total_elapsed_us"))),
+                rules=html.escape(
+                    "%s | type=%s | net_ratio=%s"
+                    % (
+                        ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none",
+                        row.get("ob_plan_type") or "n/a",
+                        _format_ratio(row.get("net_ratio")),
+                    )
+                ),
+                evidence=html.escape(
+                    "monitor=%s | plan-risk=%s | queue_us=%s | retry=%s"
+                    % (
+                        summarize_plan_monitor_evidence(row),
+                        summarize_plan_diff_signals(row),
+                        row.get("ob_queue_time_us"),
+                        row.get("ob_retry_cnt"),
+                    )
+                ),
+                sql=html.escape(build_sql_preview(row.get("sql_text"), limit=400)),
+            )
+        )
+    html_content = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>perf_comparator source report</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 24px; }
+table { border-collapse: collapse; width: 100%%; }
+th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+th { background: #f4f4f4; text-align: left; }
+pre { white-space: pre-wrap; margin: 0; }
+</style></head><body>
+<h1>perf_comparator source-only report</h1>
+<p>Run ID: %s</p>
+<p>Mode: source-only</p>
+<table>
+<thead><tr><th>SQL ID</th><th>Samples</th><th>Avg Elapsed (us)</th><th>Total Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
+<tbody>%s</tbody></table></body></html>
+""" % (html.escape(run_id), "".join(html_rows))
+    write_text(html_path, html_content)
+
+    hints_lines = ["-- perf_comparator source-only recommendations", "-- run_id: %s" % run_id, ""]
+    hints_lines.append(
+        "-- sql_text_coverage: visible=%s total=%s row_backfilled=%s row_missing=%s via=%s"
+        % (
+            visible_sql_stmt_count,
+            len(enriched_rows),
+            int(sql_text_stats.get("backfilled", 0)),
+            int(sql_text_stats.get("missing", 0)),
+            sql_text_stats.get("lookup_user") or "unconfigured",
+        )
+    )
+    if missing_sql_stmt_count > 0:
+        hints_lines.append(
+            "-- sql_text_note: configure [%s] and _enable_sql_audit_query_sql=true when QUERY_SQL is hidden from ordinary users"
+            % SECTION_OCEANBASE_SOURCE_SYS
+        )
+    hints_lines.append("")
+    for row in selected_rows:
+        hints_lines.append("-- sql_id: %s" % row.get("sql_id"))
+        hints_lines.append("-- samples: %s" % row.get("source_sample_count"))
+        hints_lines.append("-- sql_preview: %s" % build_sql_preview(row.get("sql_text"), limit=240))
+        hints_lines.append("-- monitor: %s" % summarize_plan_monitor_evidence(row))
+        hints_lines.append("-- plan-risk: %s" % summarize_plan_diff_signals(row))
+        for item in row.get("recommendations", []):
+            hints_lines.append("-- %s: %s" % (item["rule_id"], item["message"]))
+            hints_lines.append(item["hint_sql"])
+        hints_lines.append("")
+    write_text(hints_path, "\n".join(hints_lines).rstrip() + "\n")
+    return {"summary": summary_path, "html": html_path, "hints": hints_path}
+
+
 def clone_app_config(
     config,
     oracle_source=None,
     oceanbase_source=None,
+    oceanbase_source_sys=None,
     oceanbase_target=None,
     settings_updates=None,
     config_path=None,
 ):
-    # type: (AppConfig, Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, Any]], Optional[str]) -> AppConfig
+    # type: (AppConfig, Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[Dict[str, Any]], Optional[str]) -> AppConfig
     settings = dict(config.settings)
     if settings_updates:
         settings.update(settings_updates)
     return AppConfig(
         oracle_source=dict(oracle_source if oracle_source is not None else config.oracle_source),
         oceanbase_source=dict(oceanbase_source if oceanbase_source is not None else config.oceanbase_source),
+        oceanbase_source_sys=dict(
+            oceanbase_source_sys
+            if oceanbase_source_sys is not None
+            else config.oceanbase_source_sys
+        ),
         oceanbase_target=dict(oceanbase_target if oceanbase_target is not None else config.oceanbase_target),
         settings=settings,
         config_path=str(config_path or config.config_path),
@@ -3033,6 +3946,7 @@ def build_argument_parser():
             MODE_STREAM,
             MODE_REPLAY_ONLY,
             MODE_REPORT_ONLY,
+            MODE_SOURCE_REPORT,
             MODE_CHECK_CONFIG,
             MODE_VERIFY_REALDB,
         ],
@@ -3148,7 +4062,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        config = load_config(args.config)
+        config = load_config(args.config, execution_mode=args.mode)
     except ConfigError as exc:
         configure_logging("ERROR")
         LOG.error(str(exc))
@@ -3189,6 +4103,13 @@ def main(argv=None):
             replay_path = replay_workload(config, workload_path, run_id)
             report_paths = generate_report_from_replay(config, replay_path, run_id, workload_path)
             LOG.info("Batch run complete: workload=%s replay=%s summary=%s", workload_path, replay_path, report_paths["summary"])
+            return 0
+        if args.mode == MODE_SOURCE_REPORT:
+            if config.settings.get("source_db_mode") != SOURCE_DB_MODE_OCEANBASE:
+                raise ConfigError("source-report mode requires [SETTINGS] source_db_mode = oceanbase")
+            workload_path = capture_workload_from_ob_source(config, args, run_id)
+            report_paths = generate_report_from_source_workload(config, workload_path, run_id)
+            LOG.info("Source-report run complete: workload=%s summary=%s", workload_path, report_paths["summary"])
             return 0
         if args.mode == MODE_STREAM:
             workload_path = stream_capture_workload(config, args, run_id)
