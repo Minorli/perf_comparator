@@ -1,0 +1,26 @@
+schema: spec-driven
+
+context: |
+  Project: perf_comparator
+  Purpose: Compare Oracle and OceanBase SQL or PL/SQL performance regressions during migration.
+  Runtime constraints: Python 3.7 compatible, lightweight dependencies only, no Docker or Kafka assumptions.
+  Deployment constraints: Must run inside customer intranets without changing application code or network topology.
+  Architecture shape: Stage-decoupled pipeline with JSONL artifacts between capture, replay, audit dump, and reporting.
+  Product priorities: Detect Oracle-fast but OceanBase-slow SQL, compare plan behavior, emit actionable optimization guidance.
+  Observatory model: Capability probing and graceful degradation are required for both Oracle capture and OceanBase replay diagnostics.
+  Repository policy: Use OpenSpec changes for non-trivial behavior changes before implementation; treat openspec/specs as the baseline source of truth.
+  Roadmap note: Result-set verification is deferred and should be proposed explicitly before implementation.
+
+rules:
+  proposal:
+    - State which stage or capability is being added or changed.
+    - Call out deployment, observability, or compatibility risks when the change touches Oracle or OceanBase diagnostics.
+  specs:
+    - Use normative SHALL or MUST language.
+    - Keep scenarios concrete and testable for batch, stream, replay-only, or report-only operation when relevant.
+  design:
+    - Explain capability detection, fallback behavior, and intermediate artifact impacts.
+    - Prefer simple Python 3.7-compatible designs over framework-heavy solutions.
+  tasks:
+    - Break work into small stage-oriented increments with verification steps.
+    - Include tests or validation commands for any implementation-facing task.

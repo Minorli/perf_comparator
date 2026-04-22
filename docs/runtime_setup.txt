@@ -1,0 +1,57 @@
+perf_comparator runtime setup
+
+1. Runtime target
+
+- Python 3.7 is the target production runtime.
+- The application runtime is distributed as one file: perf_comparator.py
+- Current Python dependency pin:
+  - oracledb==2.3.0
+
+2. Offline installation
+
+- Prepare a Python 3.7 environment on the target server.
+- Install dependencies from requirements.txt using an internal mirror or pre-downloaded wheels.
+- If internet access is unavailable, download the wheel for `oracledb==2.3.0` in advance and install it with:
+  - python3 -m pip install --no-index --find-links <wheel_dir> -r requirements.txt
+
+3. OceanBase prerequisites
+
+- `obclient` must be installed on the target server.
+- `config.ini` must provide the absolute `obclient` path in `[OCEANBASE_TARGET].executable`.
+- `user_string` should follow the same convention used by `~/comparator`, for example:
+  - root@sys#obcluster
+
+4. Configuration contract
+
+- Oracle source:
+  - [ORACLE_SOURCE]
+  - user
+  - password
+  - dsn = host:port/service_name
+
+- OceanBase target:
+  - [OCEANBASE_TARGET]
+  - executable
+  - host
+  - port
+  - user_string
+  - password
+
+- Example starting point:
+  - config.ini.template
+
+5. Security handling
+
+- OceanBase passwords are not passed as plain-text process arguments.
+- The runtime writes the password to a temporary obclient defaults file with mode 0600 and cleans it up on exit.
+
+6. Current foundation commands
+
+- Validate config and runtime prerequisites:
+  - python3 perf_comparator.py --mode check-config --config config.ini
+
+- Other modes are scaffolded but not implemented yet:
+  - batch
+  - stream
+  - replay-only
+  - report-only

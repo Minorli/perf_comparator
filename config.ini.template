@@ -1,0 +1,26 @@
+[ORACLE_SOURCE]
+user = your_oracle_user
+password = your_oracle_password
+dsn = 127.0.0.1:1521/ORCL
+
+[OCEANBASE_TARGET]
+executable = /usr/bin/obclient
+host = 127.0.0.1
+port = 2881
+user_string = root@sys#obcluster
+password = your_oceanbase_password
+
+[SETTINGS]
+source_schemas = APP
+workloads_dir = workloads
+report_dir = reports
+log_level = INFO
+top_n = 50
+min_exec = 5
+hours = 24
+interval = 60
+audit_poll_ms = 300
+obclient_timeout = 120
+ob_session_query_timeout_us = 3600000000
+timeout_factor = 3.0
+slowdown_threshold = 0.8
