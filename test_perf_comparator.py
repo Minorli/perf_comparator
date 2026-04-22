@@ -245,6 +245,51 @@ class PerfComparatorConfigTests(unittest.TestCase):
                 cfg.oceanbase_source_sys["user_string"], "SYS@ob4ora#observer147"
             )
 
+    def test_load_config_parses_optional_external_diagnostics_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    ocp_ash_url_template = https://ocp.local/api/ash?sql_id={sql_id}
+                    ocp_qpm_url_template = https://ocp.local/api/qpm?sql_id={sql_id}
+                    ocp_auth_token_env = PERF_OCP_TOKEN
+                    ocp_timeout = 15
+                    obdiag_executable = /usr/local/bin/obdiag
+                    obdiag_timeout = 45
+                    obdiag_extra_args = collect log
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = perf_comparator.load_config(str(config_path))
+
+            self.assertEqual(
+                cfg.settings["ocp_ash_url_template"],
+                "https://ocp.local/api/ash?sql_id={sql_id}",
+            )
+            self.assertEqual(cfg.settings["ocp_qpm_url_template"], "https://ocp.local/api/qpm?sql_id={sql_id}")
+            self.assertEqual(cfg.settings["ocp_auth_token_env"], "PERF_OCP_TOKEN")
+            self.assertEqual(cfg.settings["ocp_timeout"], 15)
+            self.assertEqual(cfg.settings["obdiag_executable"], "/usr/local/bin/obdiag")
+            self.assertEqual(cfg.settings["obdiag_timeout"], 45)
+
 
 class PerfComparatorUtilityTests(unittest.TestCase):
     def test_parse_oracle_dsn(self):
@@ -989,6 +1034,49 @@ class PerfComparatorObclientTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(any("source obclient" in item.lower() for item in result.errors))
 
+    def test_probe_replay_capabilities_surfaces_optional_external_diagnostics(self):
+        cfg = perf_comparator.AppConfig(
+            oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+            oceanbase_source={},
+            oceanbase_target={
+                "executable": "/bin/echo",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@test#obcluster",
+                "password": "secret",
+            },
+            settings={
+                "source_schemas": ["APP"],
+                "obclient_timeout": 5,
+                "ob_session_query_timeout_us": 0,
+                "ocp_ash_url_template": "https://ocp.local/api/ash?sql_id={sql_id}",
+                "ocp_qpm_url_template": "https://ocp.local/api/qpm?sql_id={sql_id}",
+                "ocp_auth_token_env": "PERF_OCP_TOKEN",
+                "obdiag_executable": "/usr/local/bin/obdiag",
+            },
+            config_path="config.ini",
+        )
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            side_effect=[(True, "1\n", ""), (True, "ON\n", "")],
+        ), mock.patch.dict(os.environ, {"PERF_OCP_TOKEN": "token"}, clear=False), mock.patch.object(
+            perf_comparator,
+            "_probe_plsql_profiler_capability",
+            return_value={"available": True, "status": "ready"},
+        ), mock.patch.object(
+            perf_comparator.Path,
+            "exists",
+            return_value=True,
+        ):
+            result = perf_comparator.probe_replay_capabilities(cfg)
+
+        self.assertTrue(result["sql_audit"])
+        self.assertEqual(result["plsql_profiler"]["status"], "ready")
+        self.assertEqual(result["ocp"]["status"], "ready")
+        self.assertEqual(result["obdiag"]["status"], "ready")
+
 
 class PerfComparatorReplayEvidenceTests(unittest.TestCase):
     def _build_config(self, verify_results=False, plsql_profile=False):
@@ -1165,6 +1253,70 @@ class PerfComparatorReplayEvidenceTests(unittest.TestCase):
         self.assertEqual(replay_row["plsql_profile_status"], "ok")
         self.assertEqual(replay_row["plsql_profile_runid"], 42)
         self.assertIn("TEST_PROFILER_PKG", replay_row["plsql_profile_summary"])
+
+    def test_collect_plsql_profile_initializes_profiler_objects_once(self):
+        config = self._build_config(plsql_profile=True)
+        config.settings["_current_run_id"] = "20260422_200000"
+        config.settings["_plsql_profiler_init_status"] = None
+        workload_row = {
+            "sql_id": "pkg-1",
+            "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+        }
+
+        responses = [
+            (True, "", ""),
+            (True, "", ""),
+            (True, "42\n", ""),
+            (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t18\t10\t900000\tFOR i IN 1..500000 LOOP\n", ""),
+            (True, "", ""),
+            (True, "43\n", ""),
+            (True, "OMS_USER\tTEST_PROFILER_PKG\tPACKAGE BODY\t18\t10\t900000\tFOR i IN 1..500000 LOOP\n", ""),
+        ]
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            side_effect=responses,
+        ) as obclient_mock, mock.patch.object(
+            perf_comparator,
+            "_fetch_plsql_source_context",
+            return_value=[],
+        ):
+            first = perf_comparator.collect_plsql_profile(
+                config, workload_row, "BEGIN test_profiler_pkg.run_workload; END", 5
+            )
+            second = perf_comparator.collect_plsql_profile(
+                config, workload_row, "BEGIN test_profiler_pkg.run_workload; END", 5
+            )
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        executed_sql = [call.args[1] for call in obclient_mock.call_args_list]
+        init_calls = [
+            sql for sql in executed_sql if "DBMS_PROFILER.OB_INIT_OBJECTS(FALSE)" in sql
+        ]
+        self.assertEqual(len(init_calls), 1)
+
+    def test_collect_plsql_profile_skips_when_profiler_init_fails(self):
+        config = self._build_config(plsql_profile=True)
+        config.settings["_current_run_id"] = "20260422_200001"
+        workload_row = {
+            "sql_id": "pkg-1",
+            "sql_text": "BEGIN test_profiler_pkg.run_workload; END",
+        }
+
+        with mock.patch.object(
+            perf_comparator,
+            "obclient_run_sql",
+            return_value=(False, "", "init failed"),
+        ) as obclient_mock:
+            result = perf_comparator.collect_plsql_profile(
+                config, workload_row, "BEGIN test_profiler_pkg.run_workload; END", 5
+            )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("init failed", result["error"])
+        self.assertEqual(obclient_mock.call_count, 1)
 
 
 class PerfComparatorRealDbValidationTests(unittest.TestCase):
@@ -1716,6 +1868,84 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn("FORALL", hints_text)
             self.assertIn("MERGE INTO orders", hints_text)
 
+    def test_report_only_mode_collects_optional_external_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153000.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "baseline_avg_elapsed_us": 1000.0,
+                    "baseline_avg_logical_reads": 20.0,
+                },
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "ob_status": "ok",
+                    "ob_elapsed_us": 3000.0,
+                    "ob_logical_reads": 60.0,
+                    "ob_net_time_us": 2100.0,
+                    "ob_plan_type_raw": "3",
+                    "ob_plan_hash": "ob-1",
+                },
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    ocp_ash_url_template = https://ocp.local/api/ash?sql_id={{sql_id}}
+                    obdiag_executable = /usr/local/bin/obdiag
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "collect_external_row_diagnostics",
+                return_value={
+                    "ocp": {"status": "ok", "summary": "ash-hit", "artifact_path": "/tmp/ocp_sql-1.json"},
+                    "obdiag": {"status": "ok", "summary": "bundle-ready", "artifact_path": "/tmp/obdiag_sql-1"},
+                },
+            ) as diagnostics_mock:
+                exit_code = perf_comparator.main(
+                    ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            diagnostics_mock.assert_called()
+            html_path = next(report_dir.glob("perf_report_*.html"))
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn("ocp=ok:ash-hit", html_text)
+            self.assertIn("obdiag=ok:bundle-ready", html_text)
+            hints_path = next(report_dir.glob("perf_hints_*.sql"))
+            hints_text = hints_path.read_text(encoding="utf-8")
+            self.assertIn("external-diagnostics", hints_text)
+            self.assertIn("ash-hit", hints_text)
+
     def test_stream_mode_appends_only_new_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.ini"
@@ -2120,6 +2350,17 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn('id="overview-charts"', html_text)
             self.assertIn('id="source-distribution-chart"', html_text)
             self.assertIn('id="source-timing-chart"', html_text)
+
+
+class PerfComparatorDocumentationTests(unittest.TestCase):
+    def test_readme_exists_and_mentions_runtime_modes(self):
+        readme_path = Path(__file__).parent / "README.md"
+        self.assertTrue(readme_path.exists())
+        readme_text = readme_path.read_text(encoding="utf-8")
+        self.assertIn("Python 3.7", readme_text)
+        self.assertIn("batch", readme_text)
+        self.assertIn("source-report", readme_text)
+        self.assertIn("report-only", readme_text)
 
     def test_generate_source_report_summary_mentions_sql_text_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmpdir:

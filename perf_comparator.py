@@ -13,12 +13,15 @@ import logging
 import math
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +55,8 @@ DEFAULT_OBCLIENT_TIMEOUT = 120
 DEFAULT_OB_SESSION_QUERY_TIMEOUT_US = 3600000000
 DEFAULT_PLSQL_PROFILE_TOP_N = 10
 DEFAULT_PLSQL_PROFILE_SOURCE_CONTEXT = 1
+DEFAULT_OCP_TIMEOUT = 15
+DEFAULT_OBDIAG_TIMEOUT = 120
 
 SECTION_ORACLE_SOURCE = "ORACLE_SOURCE"
 SECTION_OCEANBASE_SOURCE = "OCEANBASE_SOURCE"
@@ -483,6 +488,13 @@ def load_config(config_path, execution_mode=None):
             settings_section, "slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD
         ),
         "wcr_path": (settings_section.get("wcr_path") or "").strip(),
+        "ocp_ash_url_template": (settings_section.get("ocp_ash_url_template") or "").strip(),
+        "ocp_qpm_url_template": (settings_section.get("ocp_qpm_url_template") or "").strip(),
+        "ocp_auth_token_env": (settings_section.get("ocp_auth_token_env") or "").strip(),
+        "ocp_timeout": _get_optional_int(settings_section, "ocp_timeout", DEFAULT_OCP_TIMEOUT),
+        "obdiag_executable": (settings_section.get("obdiag_executable") or "").strip(),
+        "obdiag_timeout": _get_optional_int(settings_section, "obdiag_timeout", DEFAULT_OBDIAG_TIMEOUT),
+        "obdiag_extra_args": (settings_section.get("obdiag_extra_args") or "").strip(),
     }
 
     return AppConfig(
@@ -1647,6 +1659,179 @@ def summarize_plsql_profile(row):
     )
 
 
+def _sanitize_filename_fragment(value):
+    # type: (Any) -> str
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._")
+    return cleaned or "unknown"
+
+
+def _format_external_template(template, values):
+    # type: (str, Dict[str, Any]) -> str
+    def replace(match):
+        # type: (Any) -> str
+        return str(values.get(match.group(1)) or "")
+
+    return re.sub(r"\{([A-Za-z0-9_]+)\}", replace, str(template or ""))
+
+
+def _build_external_diagnostic_path(report_dir, run_id, sql_id, provider, suffix):
+    # type: (Union[str, Path], str, str, str, str) -> Path
+    return Path(report_dir) / (
+        "external_diag_%s_%s_%s%s"
+        % (
+            _sanitize_filename_fragment(run_id),
+            _sanitize_filename_fragment(sql_id),
+            _sanitize_filename_fragment(provider),
+            suffix,
+        )
+    )
+
+
+def _summarize_external_payload(payload_text):
+    # type: (str) -> str
+    raw = str(payload_text or "").strip()
+    if not raw:
+        return "empty"
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return build_sql_preview(raw, limit=80)
+    if isinstance(payload, dict):
+        interesting_keys = [key for key in ("status", "message", "sql_id", "trace_id", "tenant") if key in payload]
+        if interesting_keys:
+            return ",".join("%s=%s" % (key, payload.get(key)) for key in interesting_keys)
+        return "json:%s_keys" % len(payload.keys())
+    if isinstance(payload, list):
+        return "json:list[%s]" % len(payload)
+    return build_sql_preview(raw, limit=80)
+
+
+def _summarize_external_entry(entry):
+    # type: (Optional[Dict[str, Any]]) -> str
+    if not entry:
+        return "n/a"
+    status = str(entry.get("status") or "n/a")
+    summary = str(entry.get("summary") or "").strip()
+    if summary:
+        return "%s:%s" % (status, summary)
+    return status
+
+
+def summarize_external_diagnostics(row):
+    # type: (Dict[str, Any]) -> str
+    ocp_summary = _summarize_external_entry(row.get("ocp_diagnostic"))
+    obdiag_summary = _summarize_external_entry(row.get("obdiag_diagnostic"))
+    if ocp_summary in ("n/a", "unconfigured") and obdiag_summary in ("n/a", "unconfigured"):
+        return "n/a"
+    return "ocp=%s | obdiag=%s" % (ocp_summary, obdiag_summary)
+
+
+def _merge_external_diagnostics(row, diagnostics):
+    # type: (Dict[str, Any], Dict[str, Any]) -> Dict[str, Any]
+    merged = dict(row)
+    merged["ocp_diagnostic"] = diagnostics.get("ocp") or merged.get("ocp_diagnostic") or {}
+    merged["obdiag_diagnostic"] = diagnostics.get("obdiag") or merged.get("obdiag_diagnostic") or {}
+    return merged
+
+
+def _should_collect_external_row_diagnostics(row, slowdown_threshold):
+    # type: (Dict[str, Any], float) -> bool
+    if str(row.get("ob_status") or "ok") != "ok":
+        return False
+    if should_collect_plan_monitor(row, slowdown_threshold):
+        return True
+    source_total_elapsed_us = _safe_float(row.get("source_total_elapsed_us"))
+    if source_total_elapsed_us is not None and source_total_elapsed_us > 0.0:
+        return True
+    return False
+
+
+def _build_external_context(row, run_id):
+    # type: (Dict[str, Any], str) -> Dict[str, Any]
+    return {
+        "run_id": run_id,
+        "sql_id": str(row.get("sql_id") or ""),
+        "trace_id": str(row.get("source_ob_trace_id") or row.get("trace_id") or ""),
+        "request_id": str(row.get("source_ob_request_id") or row.get("request_id") or ""),
+        "schema": str(row.get("schema") or ""),
+    }
+
+
+def _collect_ocp_row_diagnostics(config, row, run_id):
+    # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
+    capability = _probe_ocp_capability(config)
+    if capability.get("status") != "ready":
+        return {"status": str(capability.get("status") or "unconfigured"), "summary": str(capability.get("error") or ""), "artifact_path": ""}
+    context = _build_external_context(row, run_id)
+    report_dir = config.settings["report_dir"]
+    timeout_seconds = int(config.settings.get("ocp_timeout", DEFAULT_OCP_TIMEOUT))
+    token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
+    token_value = os.environ.get(token_env) if token_env else ""
+    headers = {}
+    if token_value:
+        headers["Authorization"] = "Bearer %s" % token_value
+    payload = {}
+    summaries = []
+    for provider_name, template_key in (("ash", "ocp_ash_url_template"), ("qpm", "ocp_qpm_url_template")):
+        template = str(config.settings.get(template_key) or "").strip()
+        if not template:
+            continue
+        url = _format_external_template(template, context)
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout_seconds)
+            body = response.read().decode("utf-8", errors="ignore")
+        except Exception as exc:
+            return {"status": "error", "summary": str(exc), "artifact_path": ""}
+        artifact_path = _build_external_diagnostic_path(report_dir, run_id, context["sql_id"], provider_name, ".txt")
+        write_text(artifact_path, body)
+        summary = _summarize_external_payload(body)
+        payload[provider_name] = {"url": url, "artifact_path": str(artifact_path), "summary": summary}
+        summaries.append("%s:%s" % (provider_name, summary))
+    if not payload:
+        return {"status": "unconfigured", "summary": "", "artifact_path": ""}
+    return {"status": "ok", "summary": "; ".join(summaries), "artifact_path": json.dumps(payload, sort_keys=True), "payload": payload}
+
+
+def _collect_obdiag_row_diagnostics(config, row, run_id):
+    # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
+    capability = _probe_obdiag_capability(config)
+    if capability.get("status") != "ready":
+        return {"status": str(capability.get("status") or "unconfigured"), "summary": str(capability.get("error") or ""), "artifact_path": ""}
+    context = _build_external_context(row, run_id)
+    executable = str(config.settings.get("obdiag_executable") or "").strip()
+    output_path = _build_external_diagnostic_path(config.settings["report_dir"], run_id, context["sql_id"], "obdiag", ".txt")
+    args = [executable]
+    extra_args = str(config.settings.get("obdiag_extra_args") or "").strip()
+    if extra_args:
+        for token in shlex.split(extra_args):
+            args.append(_format_external_template(token, context))
+    try:
+        completed = subprocess.run(  # nosec - operator-provided binary path with explicit args
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=int(config.settings.get("obdiag_timeout", DEFAULT_OBDIAG_TIMEOUT)),
+            check=False,
+            universal_newlines=True,
+        )
+    except Exception as exc:
+        return {"status": "error", "summary": str(exc), "artifact_path": ""}
+    body = (completed.stdout or "") + ("\n" + completed.stderr if completed.stderr else "")
+    write_text(output_path, body)
+    status = "ok" if completed.returncode == 0 else "error"
+    summary = _summarize_external_payload(body) if body.strip() else "exit=%s" % completed.returncode
+    return {"status": status, "summary": summary, "artifact_path": str(output_path)}
+
+
+def collect_external_row_diagnostics(config, row, run_id):
+    # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
+    return {
+        "ocp": _collect_ocp_row_diagnostics(config, row, run_id),
+        "obdiag": _collect_obdiag_row_diagnostics(config, row, run_id),
+    }
+
+
 def sql_literal(value):
     # type: (Any) -> str
     if value is None:
@@ -2259,6 +2444,24 @@ def validate_runtime_paths(config):
             "python-oracledb is not installed in the current environment; Oracle capture will not run"
         )
 
+    obdiag_executable = str(config.settings.get("obdiag_executable") or "").strip()
+    if obdiag_executable:
+        obdiag_path = Path(obdiag_executable).expanduser()
+        if not obdiag_path.exists():
+            result.warnings.append("obdiag executable not found: %s" % str(obdiag_path))
+        elif not os.access(str(obdiag_path), os.X_OK):
+            result.warnings.append(
+                "obdiag executable exists but is not executable: %s" % str(obdiag_path)
+            )
+
+    token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
+    has_ocp_templates = bool(
+        str(config.settings.get("ocp_ash_url_template") or "").strip()
+        or str(config.settings.get("ocp_qpm_url_template") or "").strip()
+    )
+    if has_ocp_templates and token_env and not os.environ.get(token_env):
+        result.warnings.append("OCP auth token env is not set: %s" % token_env)
+
     return result
 
 
@@ -2355,12 +2558,23 @@ def probe_oracle_capabilities(config):
 def probe_replay_capabilities(config):
     # type: (AppConfig) -> Dict[str, Any]
     if not config.oceanbase_target:
-        return {"obclient": False, "sql_audit": False, "explain": False, "configured": False}
+        return {
+            "obclient": False,
+            "sql_audit": False,
+            "explain": False,
+            "configured": False,
+            "plsql_profiler": {"available": False, "status": "unconfigured", "error": ""},
+            "ocp": _probe_ocp_capability(config),
+            "obdiag": _probe_obdiag_capability(config),
+        }
     ob_cfg = config.oceanbase_target
     capabilities = {
         "obclient": Path(ob_cfg["executable"]).exists(),
         "sql_audit": False,
         "explain": False,
+        "plsql_profiler": {"available": False, "status": "unavailable", "error": ""},
+        "ocp": _probe_ocp_capability(config),
+        "obdiag": _probe_obdiag_capability(config),
     }
     if not capabilities["obclient"]:
         return capabilities
@@ -2391,6 +2605,7 @@ def probe_replay_capabilities(config):
     capabilities["sql_audit"] = ok and "OFF" not in (stdout or "").upper()
     if stderr and not ok:
         capabilities["sql_audit_error"] = stderr
+    capabilities["plsql_profiler"] = _probe_plsql_profiler_capability(config)
     return capabilities
 
 
@@ -3310,6 +3525,94 @@ def _escape_sql_string(value):
     return str(value or "").replace("'", "''")
 
 
+def _probe_plsql_profiler_capability(config):
+    # type: (AppConfig) -> Dict[str, Any]
+    query = """
+        SELECT COUNT(*)
+        FROM ALL_OBJECTS
+        WHERE OBJECT_NAME = 'DBMS_PROFILER'
+          AND OBJECT_TYPE = 'PACKAGE'
+    """
+    ok, stdout, stderr = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok:
+        return {"available": False, "status": "unavailable", "error": stderr or stdout}
+    count_value = _safe_int((stdout or "").splitlines()[0].split("\t")[0] if stdout.strip() else None) or 0
+    if count_value > 0:
+        return {"available": True, "status": "ready", "error": ""}
+    return {"available": False, "status": "unavailable", "error": "DBMS_PROFILER package not found"}
+
+
+def _probe_ocp_capability(config):
+    # type: (AppConfig) -> Dict[str, Any]
+    ash_template = str(config.settings.get("ocp_ash_url_template") or "").strip()
+    qpm_template = str(config.settings.get("ocp_qpm_url_template") or "").strip()
+    if not ash_template and not qpm_template:
+        return {"available": False, "status": "unconfigured", "error": ""}
+    token_env = str(config.settings.get("ocp_auth_token_env") or "").strip()
+    if token_env and not os.environ.get(token_env):
+        return {
+            "available": False,
+            "status": "misconfigured",
+            "error": "missing auth token env: %s" % token_env,
+        }
+    return {
+        "available": True,
+        "status": "ready",
+        "error": "",
+        "has_ash": bool(ash_template),
+        "has_qpm": bool(qpm_template),
+    }
+
+
+def _probe_obdiag_capability(config):
+    # type: (AppConfig) -> Dict[str, Any]
+    executable = str(config.settings.get("obdiag_executable") or "").strip()
+    if not executable:
+        return {"available": False, "status": "unconfigured", "error": ""}
+    if not Path(executable).exists():
+        return {"available": False, "status": "unavailable", "error": "obdiag executable not found"}
+    return {"available": True, "status": "ready", "error": "", "executable": executable}
+
+
+def has_external_diagnostics_config(config):
+    # type: (AppConfig) -> bool
+    return bool(
+        str(config.settings.get("ocp_ash_url_template") or "").strip()
+        or str(config.settings.get("ocp_qpm_url_template") or "").strip()
+        or str(config.settings.get("obdiag_executable") or "").strip()
+    )
+
+
+def ensure_plsql_profiler_initialized(config):
+    # type: (AppConfig) -> Tuple[bool, str]
+    cached = config.settings.get("_plsql_profiler_init_status")
+    if isinstance(cached, dict):
+        return bool(cached.get("ok")), str(cached.get("reason") or "")
+    init_sql = "CALL DBMS_PROFILER.OB_INIT_OBJECTS(FALSE);"
+    ok, stdout, stderr = obclient_run_sql(
+        config.oceanbase_target,
+        init_sql,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    combined = " ".join(part for part in (stdout, stderr) if part).lower()
+    if ok or "already exists" in combined:
+        config.settings["_plsql_profiler_init_status"] = {"ok": True, "reason": ""}
+        return True, ""
+    reason = (stderr or stdout or "profiler_init_failed").strip()
+    config.settings["_plsql_profiler_init_status"] = {"ok": False, "reason": reason}
+    return False, reason
+
+
 def _build_plsql_profiler_payload(rendered_sql, profiler_comment):
     # type: (str, str) -> str
     return "\n".join(
@@ -3464,6 +3767,15 @@ def _fetch_plsql_profile_top_lines(config, runid, top_n, context_size):
 
 def collect_plsql_profile(config, workload_row, rendered_sql, timeout_seconds):
     # type: (AppConfig, Dict[str, Any], str, int) -> Dict[str, Any]
+    init_ok, init_reason = ensure_plsql_profiler_initialized(config)
+    if not init_ok:
+        return {
+            "status": "skipped",
+            "error": init_reason,
+            "runid": None,
+            "top_lines": [],
+            "artifact_path": "",
+        }
     run_group = str(config.settings.get("_current_run_id") or generate_run_id())
     profiler_comment = "perf_comparator:%s:%s:%s" % (
         run_group,
@@ -3869,6 +4181,19 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
     enriched_rows = sorted(enriched_rows, key=sort_key)
     top_n = int(config.settings.get("top_n", DEFAULT_TOP_N))
     selected_rows = enriched_rows[:top_n]
+    slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
+    materialized_selected_rows = []
+    for row in selected_rows:
+        if has_external_diagnostics_config(config) and _should_collect_external_row_diagnostics(row, slowdown_threshold):
+            try:
+                row = _merge_external_diagnostics(
+                    row,
+                    collect_external_row_diagnostics(config, row, run_id),
+                )
+            except Exception:
+                LOG.exception("External diagnostics collection failed for sql_id=%s", row.get("sql_id"))
+        materialized_selected_rows.append(row)
+    selected_rows = materialized_selected_rows
     report_dir = Path(config.settings["report_dir"])
     summary_path = build_artifact_path("report_summary", run_id, root_dir=report_dir)
     html_path = build_artifact_path("report_html", run_id, root_dir=report_dir)
@@ -3892,7 +4217,8 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         plan_monitor_summary = summarize_plan_monitor_evidence(row)
         plan_risk_summary = summarize_plan_diff_signals(row)
         plsql_profile_summary = summarize_plsql_profile(row)
-        summary_lines.append(
+        external_summary = summarize_external_diagnostics(row)
+        summary_line = (
             "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s plan_risk=%s plsql=%s"
             % (
                 idx,
@@ -3907,6 +4233,9 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 plsql_profile_summary,
             )
         )
+        if external_summary != "n/a":
+            summary_line = "%s external=%s" % (summary_line, external_summary)
+        summary_lines.append(summary_line)
     write_text(summary_path, "\n".join(summary_lines) + "\n")
 
     html_rows = []
@@ -3915,6 +4244,15 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         plan_monitor_summary = summarize_plan_monitor_evidence(row)
         plan_risk_summary = summarize_plan_diff_signals(row)
         plsql_profile_summary = summarize_plsql_profile(row)
+        external_summary = summarize_external_diagnostics(row)
+        evidence_parts = [
+            "verification=%s" % verification_status,
+            "monitor=%s" % plan_monitor_summary,
+            "plan-risk=%s" % plan_risk_summary,
+            "plsql=%s" % plsql_profile_summary,
+        ]
+        if external_summary != "n/a":
+            evidence_parts.append(external_summary)
         html_rows.append(
             "<tr><td>{sql_id}</td><td>{speedup}</td><td>{oracle}</td><td>{ob}</td><td>{rules}</td><td>{evidence}</td><td><pre>{sql}</pre></td></tr>".format(
                 sql_id=html.escape(str(row.get("sql_id"))),
@@ -3929,15 +4267,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                         row.get("ob_plan_type") or "n/a",
                     )
                 ),
-                evidence=html.escape(
-                    "verification=%s | monitor=%s | plan-risk=%s | plsql=%s"
-                    % (
-                        verification_status,
-                        plan_monitor_summary,
-                        plan_risk_summary,
-                        plsql_profile_summary,
-                    )
-                ),
+                evidence=html.escape(" | ".join(evidence_parts)),
                 sql=html.escape(str(row.get("sql_text") or "")),
             )
         )
@@ -3982,6 +4312,9 @@ svg text { font-family: Arial, sans-serif; fill: #1a202c; }
             hints_lines.append(
                 "-- plsql-profile: %s" % summarize_plsql_profile(row)
             )
+        external_summary = summarize_external_diagnostics(row)
+        if external_summary != "n/a":
+            hints_lines.append("-- external-diagnostics: %s" % external_summary)
         for item in row.get("recommendations", []):
             hints_lines.append("-- %s: %s" % (item["rule_id"], item["message"]))
             hints_lines.append(item["hint_sql"])
@@ -4032,6 +4365,18 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     )
     top_n = int(config.settings.get("top_n", DEFAULT_TOP_N))
     selected_rows = enriched_rows[:top_n]
+    materialized_selected_rows = []
+    for row in selected_rows:
+        if has_external_diagnostics_config(config) and _should_collect_external_row_diagnostics(row, slowdown_threshold):
+            try:
+                row = _merge_external_diagnostics(
+                    row,
+                    collect_external_row_diagnostics(config, row, run_id),
+                )
+            except Exception:
+                LOG.exception("External diagnostics collection failed for source sql_id=%s", row.get("sql_id"))
+        materialized_selected_rows.append(row)
+    selected_rows = materialized_selected_rows
     report_dir = Path(config.settings["report_dir"])
     summary_path = build_artifact_path("report_summary", run_id, root_dir=report_dir)
     html_path = build_artifact_path("report_html", run_id, root_dir=report_dir)
@@ -4063,7 +4408,8 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         summary_lines.append("")
     for idx, row in enumerate(selected_rows, 1):
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
-        summary_lines.append(
+        external_summary = summarize_external_diagnostics(row)
+        summary_line = (
             "%d. sql_id=%s samples=%s avg_elapsed_us=%s total_elapsed_us=%s rules=%s monitor=%s plan_risk=%s"
             % (
                 idx,
@@ -4076,11 +4422,23 @@ def generate_report_from_source_workload(config, workload_path, run_id):
                 summarize_plan_diff_signals(row),
             )
         )
+        if external_summary != "n/a":
+            summary_line = "%s external=%s" % (summary_line, external_summary)
+        summary_lines.append(summary_line)
         summary_lines.append("   sql: %s" % build_sql_preview(row.get("sql_text")))
     write_text(summary_path, "\n".join(summary_lines) + "\n")
 
     html_rows = []
     for row in selected_rows:
+        external_summary = summarize_external_diagnostics(row)
+        evidence_parts = [
+            "monitor=%s" % summarize_plan_monitor_evidence(row),
+            "plan-risk=%s" % summarize_plan_diff_signals(row),
+            "queue_us=%s" % row.get("ob_queue_time_us"),
+            "retry=%s" % row.get("ob_retry_cnt"),
+        ]
+        if external_summary != "n/a":
+            evidence_parts.append(external_summary)
         html_rows.append(
             "<tr><td>{sql_id}</td><td>{samples}</td><td>{avg_elapsed}</td><td>{total_elapsed}</td><td>{rules}</td><td>{evidence}</td><td><pre>{sql}</pre></td></tr>".format(
                 sql_id=html.escape(str(row.get("sql_id"))),
@@ -4095,15 +4453,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
                         _format_ratio(row.get("net_ratio")),
                     )
                 ),
-                evidence=html.escape(
-                    "monitor=%s | plan-risk=%s | queue_us=%s | retry=%s"
-                    % (
-                        summarize_plan_monitor_evidence(row),
-                        summarize_plan_diff_signals(row),
-                        row.get("ob_queue_time_us"),
-                        row.get("ob_retry_cnt"),
-                    )
-                ),
+                evidence=html.escape(" | ".join(evidence_parts)),
                 sql=html.escape(build_sql_preview(row.get("sql_text"), limit=400)),
             )
         )
@@ -4153,6 +4503,9 @@ pre { white-space: pre-wrap; margin: 0; }
         hints_lines.append("-- sql_preview: %s" % build_sql_preview(row.get("sql_text"), limit=240))
         hints_lines.append("-- monitor: %s" % summarize_plan_monitor_evidence(row))
         hints_lines.append("-- plan-risk: %s" % summarize_plan_diff_signals(row))
+        external_summary = summarize_external_diagnostics(row)
+        if external_summary != "n/a":
+            hints_lines.append("-- external-diagnostics: %s" % external_summary)
         for item in row.get("recommendations", []):
             hints_lines.append("-- %s: %s" % (item["rule_id"], item["message"]))
             hints_lines.append(item["hint_sql"])

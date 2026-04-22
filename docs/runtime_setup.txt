@@ -66,6 +66,18 @@ perf_comparator runtime setup
   - or pass `--wcr-path` on the command line
   - used as a fallback when AWR, V$SQL, and Unified Audit are unavailable
 
+- Optional external diagnostics:
+  - `plsql_profile = true`
+    - on first use the runtime will attempt `CALL DBMS_PROFILER.OB_INIT_OBJECTS(FALSE);`
+  - `ocp_ash_url_template` / `ocp_qpm_url_template`
+    - optional URL templates for OCP or operator-owned proxy endpoints
+  - `ocp_auth_token_env`
+    - environment variable name holding a bearer token, if required
+  - `obdiag_executable`
+    - optional obdiag or wrapper executable for severe-regression collection
+  - `obdiag_extra_args`
+    - extra command-line arguments, with placeholders such as `{sql_id}` or `{run_id}`
+
 5. Security handling
 
 - OceanBase passwords are not passed as plain-text process arguments.
@@ -96,6 +108,7 @@ perf_comparator runtime setup
 
 - `report-only`
   - python3 perf_comparator.py --mode report-only --config config.ini --replay workloads/replay_<ts>.jsonl
+  - if OCP or obdiag are configured, top severe regressions can be enriched with external evidence
 
 - `stream`
   - Oracle source only in the current implementation
