@@ -68,8 +68,10 @@ perf_comparator runtime setup
 
 - Rolling source-report controls:
   - [SETTINGS]
+  - capture_top_n = 1000
   - rolling_report_interval = 300
   - source_actor_fields = tenant_name,db_name,user_name,user_client_ip
+  - `capture_top_n` controls Oracle capture breadth independently from report display count
   - `rolling_report_interval = 0` disables live report refresh
   - `source_actor_fields` defines how caller groups are built for testing-team attribution
 
@@ -131,7 +133,18 @@ perf_comparator runtime setup
   - if OCP or obdiag are configured, top severe regressions can be enriched with external evidence
 
 - `stream`
-  - Oracle source only in the current implementation
+  - Oracle source long-running monitor
+  - example:
+    - python3 perf_comparator.py --mode stream --config config.ini --duration 86400 --interval 60 --rolling-report-interval 300 --capture-top-n 1000
+  - while monitoring is running, the runtime:
+    - captures newly observed Oracle SQL / PL/SQL fingerprints from `V$SQL`
+    - replays them to OceanBase immediately
+    - refreshes the same report files in place
+  - `capture_top_n` should usually be much larger than report `top_n`
+  - rolling replay reports now surface:
+    - top slow SQL
+    - top slow PL/SQL
+    - detailed regression rows and recommendations
 
 - `source-report`
   - single OceanBase troubleshooting mode, no Oracle comparison and no target replay
@@ -140,6 +153,7 @@ perf_comparator runtime setup
     - `[OCEANBASE_SOURCE]`
   - recommended:
     - `[OCEANBASE_SOURCE_SYS]` for SQL text backfill on OB 4.2.5
+  - if `[OCEANBASE_SOURCE]` is not a `SYS` login, the runtime emits a prominent warning because `GV$OB_SQL_AUDIT.QUERY_SQL` may be hidden
   - example:
     - python3 perf_comparator.py --mode source-report --config config.ini --duration 86400 --rolling-report-interval 300
   - while capture is running, the runtime refreshes the same report paths so operators can watch the current 24-hour hotspot view

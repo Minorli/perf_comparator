@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import oracledb  # type: ignore
@@ -54,6 +54,7 @@ DEFAULT_TIMEOUT_FACTOR = 3.0
 DEFAULT_SLOWDOWN_THRESHOLD = 0.8
 DEFAULT_INTERVAL = 60
 DEFAULT_ROLLING_REPORT_INTERVAL = 300
+DEFAULT_CAPTURE_TOP_N = 1000
 DEFAULT_AUDIT_POLL_MS = 300
 DEFAULT_OBCLIENT_TIMEOUT = 120
 DEFAULT_OB_SESSION_QUERY_TIMEOUT_US = 3600000000
@@ -370,6 +371,81 @@ def normalize_csv_list(value):
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
+def is_sys_ob_user_string(user_string):
+    # type: (Any) -> bool
+    normalized = str(user_string or "").strip().upper()
+    return normalized.startswith("SYS@")
+
+
+def get_capture_top_n(config):
+    # type: (AppConfig) -> int
+    configured = int(config.settings.get("capture_top_n", 0) or 0)
+    if configured > 0:
+        return configured
+    return max(int(config.settings.get("top_n", DEFAULT_TOP_N) or DEFAULT_TOP_N), DEFAULT_CAPTURE_TOP_N)
+
+
+def build_query_sql_visibility_warning(config):
+    # type: (AppConfig) -> str
+    if config.settings.get("source_db_mode") != SOURCE_DB_MODE_OCEANBASE:
+        return ""
+    source_user = str(config.oceanbase_source.get("user_string") or "").strip()
+    if not source_user or is_sys_ob_user_string(source_user):
+        return ""
+    if config.oceanbase_source_sys:
+        return (
+            "QUERY_SQL visibility warning: [OCEANBASE_SOURCE] uses non-SYS login (%s). "
+            "Runtime will backfill SQL text through [%s]. If coverage is still low, use SYS "
+            "or enable _enable_sql_audit_query_sql=true."
+        ) % (source_user, SECTION_OCEANBASE_SOURCE_SYS)
+    return (
+        "QUERY_SQL visibility warning: [OCEANBASE_SOURCE] uses non-SYS login (%s). "
+        "GV$OB_SQL_AUDIT.QUERY_SQL may be hidden on OB 4.2.5. Use SYS, configure [%s], "
+        "or enable _enable_sql_audit_query_sql=true."
+    ) % (source_user, SECTION_OCEANBASE_SOURCE_SYS)
+
+
+def emit_prominent_runtime_warnings(config, mode):
+    # type: (AppConfig, str) -> None
+    messages = []
+    visibility_warning = build_query_sql_visibility_warning(config)
+    if visibility_warning and mode in (MODE_BATCH, MODE_SOURCE_REPORT):
+        messages.append(visibility_warning)
+    if mode == MODE_STREAM:
+        messages.append(
+            "Rolling Oracle-to-OceanBase monitor is active: new Oracle SQL and PL/SQL fingerprints "
+            "will be replayed to OceanBase and report files will refresh in place."
+        )
+    for message in messages:
+        LOG.warning("=" * 88)
+        LOG.warning(message)
+        LOG.warning("=" * 88)
+
+
+def classify_replay_workload_type(sql_text):
+    # type: (Any) -> str
+    return "plsql" if is_plsql_statement(str(sql_text or "")) else "sql"
+
+
+def build_workload_identity(row):
+    # type: (Dict[str, Any]) -> str
+    schema = str(row.get("schema") or "").strip().upper()
+    sql_id = str(row.get("sql_id") or "").strip() or compute_sql_id(str(row.get("sql_text") or ""))
+    normalized = normalize_sql_text(str(row.get("sql_text") or ""))
+    return "%s|%s|%s" % (schema, sql_id, normalized)
+
+
+def build_workload_event_id(row):
+    # type: (Dict[str, Any]) -> str
+    payload = "|".join(
+        [
+            build_workload_identity(row),
+            str(row.get("captured_at") or ""),
+        ]
+    )
+    return compute_sql_id(payload)
+
+
 def _get_required_section(parser, section_name):
     # type: (configparser.ConfigParser, str) -> configparser.SectionProxy
     if not parser.has_section(section_name):
@@ -469,6 +545,7 @@ def load_config(config_path, execution_mode=None):
         or DEFAULT_REPORT_DIR,
         "log_level": (settings_section.get("log_level") or "INFO").strip().upper() or "INFO",
         "top_n": _get_optional_int(settings_section, "top_n", DEFAULT_TOP_N),
+        "capture_top_n": _get_optional_int(settings_section, "capture_top_n", DEFAULT_CAPTURE_TOP_N),
         "min_exec": _get_optional_int(settings_section, "min_exec", DEFAULT_MIN_EXEC),
         "hours": _get_optional_int(settings_section, "hours", DEFAULT_HOURS),
         "interval": _get_optional_int(settings_section, "interval", DEFAULT_INTERVAL),
@@ -3335,6 +3412,9 @@ def validate_runtime_paths(config):
                     "source SYS obclient executable exists but is not executable: %s"
                     % str(source_sys_ob_path)
                 )
+        visibility_warning = build_query_sql_visibility_warning(config)
+        if visibility_warning:
+            result.warnings.append(visibility_warning)
 
     if oracledb is None and config.oracle_source:
         result.warnings.append(
@@ -3585,7 +3665,7 @@ def _capture_from_unified_audit(connection, config):
     # type: (Any, AppConfig) -> List[Dict[str, Any]]
     schemas = config.settings["source_schemas"]
     placeholders, binds = _oracle_schema_placeholders("schema", schemas)
-    binds.update({"hours": int(config.settings["hours"]), "top_n": int(config.settings["top_n"])})
+    binds.update({"hours": int(config.settings["hours"]), "top_n": get_capture_top_n(config)})
     query = """
         SELECT * FROM (
           SELECT
@@ -3839,7 +3919,13 @@ def _capture_from_vsql(connection, config, since_ts=None):
     # type: (Any, AppConfig, Optional[str]) -> List[Dict[str, Any]]
     schemas = config.settings["source_schemas"]
     placeholders, binds = _oracle_schema_placeholders("schema", schemas)
-    binds.update({"hours": int(config.settings["hours"]), "min_exec": int(config.settings["min_exec"]), "top_n": int(config.settings["top_n"])})
+    binds.update(
+        {
+            "hours": int(config.settings["hours"]),
+            "min_exec": int(config.settings["min_exec"]),
+            "top_n": get_capture_top_n(config),
+        }
+    )
     time_filter = (
         "AND LAST_ACTIVE_TIME > TO_TIMESTAMP(:since_ts, 'YYYY-MM-DD\"T\"HH24:MI:SS')"
         if since_ts
@@ -3902,7 +3988,13 @@ def _capture_from_awr(connection, config):
     # type: (Any, AppConfig) -> List[Dict[str, Any]]
     schemas = config.settings["source_schemas"]
     placeholders, binds = _oracle_schema_placeholders("schema", schemas)
-    binds.update({"hours": int(config.settings["hours"]), "min_exec": int(config.settings["min_exec"]), "top_n": int(config.settings["top_n"])})
+    binds.update(
+        {
+            "hours": int(config.settings["hours"]),
+            "min_exec": int(config.settings["min_exec"]),
+            "top_n": get_capture_top_n(config),
+        }
+    )
     query = """
         SELECT * FROM (
           SELECT
@@ -4394,6 +4486,103 @@ def stream_capture_workload(config, args, run_id):
     if not workload_path.exists():
         raise ConfigError("stream mode did not capture any workload rows")
     return workload_path
+
+
+def maybe_refresh_replay_report(config, replay_path, run_id, workload_path, last_refresh_at, force=False):
+    # type: (AppConfig, Union[str, Path], str, Union[str, Path], float, bool) -> float
+    refresh_interval = int(config.settings.get("rolling_report_interval", DEFAULT_ROLLING_REPORT_INTERVAL) or 0)
+    if refresh_interval <= 0:
+        return float(last_refresh_at or 0.0)
+    now = time.time()
+    if not force and now - float(last_refresh_at or 0.0) < refresh_interval:
+        return float(last_refresh_at or 0.0)
+    if not Path(replay_path).exists():
+        return float(last_refresh_at or 0.0)
+    rolling_config = clone_app_config(config, settings_updates={"_rolling_stream_report": True})
+    generate_report_from_replay(rolling_config, replay_path, run_id, workload_path)
+    LOG.info("Rolling Oracle->OB report refreshed: run_id=%s", run_id)
+    return now
+
+
+def run_stream_monitor_pipeline(config, args, run_id):
+    # type: (AppConfig, argparse.Namespace, str) -> Dict[str, Path]
+    if getattr(args, "sql_file", None):
+        raise ConfigError("stream mode does not support --sql-file")
+    config.settings["_current_run_id"] = run_id
+    capture_capabilities = probe_oracle_capabilities(config)
+    capture_capabilities["run_id"] = run_id
+    capture_capabilities["oracle_dsn"] = config.oracle_source["dsn"]
+    replay_capabilities = probe_replay_capabilities(config)
+    replay_capabilities["run_id"] = run_id
+    write_capability_files(config, run_id, capture_capabilities, replay_capabilities)
+    if not capture_capabilities.get("vsql"):
+        raise ConfigError("stream mode requires Oracle V$SQL access")
+    duration = int(getattr(args, "duration", 0) or config.settings.get("duration", config.settings["interval"]))
+    if duration <= 0:
+        duration = config.settings["interval"]
+    workload_path = build_artifact_path("workload", run_id, root_dir=config.settings["workloads_dir"])
+    replay_path = build_artifact_path("replay", run_id, root_dir=config.settings["workloads_dir"])
+    started = time.time()
+    watermark = None  # type: Optional[str]
+    last_report_refresh_at = 0.0
+    seen_fingerprints = set()  # type: Set[str]
+    connection = _open_oracle_connection(config)
+    collector = None  # type: Optional[SQLAuditCollector]
+    backend = ObclientReplayBackend()
+    if replay_capabilities.get("sql_audit"):
+        audit_dump_path = build_artifact_path("audit_dump", run_id, root_dir=config.settings["workloads_dir"])
+        collector = SQLAuditCollector(config, audit_dump_path)
+        collector.start()
+    try:
+        while True:
+            rows = _capture_from_vsql(connection, config, since_ts=watermark)
+            if rows:
+                watermark = max(str(row.get("captured_at") or "") for row in rows) or watermark
+            new_rows = []
+            for row in rows:
+                row["source"] = "stream_vsql"
+                row["workload_identity"] = build_workload_identity(row)
+                row["workload_event_id"] = build_workload_event_id(row)
+                if row["workload_identity"] in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(row["workload_identity"])
+                new_rows.append(row)
+            if new_rows:
+                append_jsonl(workload_path, new_rows)
+                replay_rows = []
+                for workload_row in new_rows:
+                    replay_row = replay_statement(
+                        config, workload_row, audit_collector=collector, backend=backend
+                    )
+                    replay_row["workload_identity"] = workload_row.get("workload_identity")
+                    replay_row["workload_event_id"] = workload_row.get("workload_event_id")
+                    replay_rows.append(replay_row)
+                append_jsonl(replay_path, replay_rows)
+                last_report_refresh_at = maybe_refresh_replay_report(
+                    config, replay_path, run_id, workload_path, last_report_refresh_at
+                )
+            if time.time() - started >= duration:
+                break
+            time.sleep(int(config.settings.get("interval", DEFAULT_INTERVAL)))
+    finally:
+        if collector is not None:
+            collector.stop()
+        connection.close()
+    if not workload_path.exists():
+        raise ConfigError("stream mode did not capture any workload rows")
+    if not replay_path.exists():
+        raise ConfigError("stream mode did not produce any replay rows")
+    last_report_refresh_at = maybe_refresh_replay_report(
+        config, replay_path, run_id, workload_path, last_report_refresh_at, force=True
+    )
+    report_paths = generate_report_from_replay(config, replay_path, run_id, workload_path)
+    LOG.info(
+        "Rolling stream monitor complete: workload=%s replay=%s summary=%s",
+        workload_path,
+        replay_path,
+        report_paths["summary"],
+    )
+    return {"workload": workload_path, "replay": replay_path, "summary": report_paths["summary"]}
 
 
 def _query_recent_audit_row(config, rendered_sql):
@@ -5564,6 +5753,7 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
             base,
             slowdown_threshold=float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD)),
         )
+        base["replay_workload_type"] = classify_replay_workload_type(base.get("sql_text"))
         enriched_rows.append(base)
     sort_key = lambda item: (
         item.get("speedup_ratio") is None,
@@ -5573,9 +5763,10 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
     top_n = int(config.settings.get("top_n", DEFAULT_TOP_N))
     selected_rows = enriched_rows[:top_n]
     slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
+    rolling_mode = bool(config.settings.get("_rolling_stream_report"))
     materialized_selected_rows = []
     for row in selected_rows:
-        if has_external_diagnostics_config(config) and _should_collect_external_row_diagnostics(row, slowdown_threshold):
+        if (not rolling_mode) and has_external_diagnostics_config(config) and _should_collect_external_row_diagnostics(row, slowdown_threshold):
             try:
                 row = _merge_external_diagnostics(
                     row,
@@ -5589,19 +5780,60 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
     summary_path = build_artifact_path("report_summary", run_id, root_dir=report_dir)
     html_path = build_artifact_path("report_html", run_id, root_dir=report_dir)
     hints_path = build_artifact_path("report_hints", run_id, root_dir=report_dir)
+    top_sql_rows = [row for row in selected_rows if str(row.get("replay_workload_type") or "sql") != "plsql"][:5]
+    top_plsql_rows = [row for row in selected_rows if str(row.get("replay_workload_type") or "sql") == "plsql"][:5]
 
     summary_lines = [
         "Run ID: %s" % run_id,
         "Replay file: %s" % str(replay_path),
+        "Report Mode: %s" % ("oracle-to-ob-rolling" if rolling_mode else "oracle-to-ob"),
         "Total statements: %d" % len(enriched_rows),
         "Successful statements: %d" % sum(1 for row in enriched_rows if row.get("ob_status") == "ok"),
         "Failed statements: %d" % sum(1 for row in enriched_rows if row.get("ob_status") != "ok"),
         "Verified matches: %d" % sum(1 for row in enriched_rows if row.get("verification_status") == "match"),
         "Verified mismatches: %d" % sum(1 for row in enriched_rows if row.get("verification_status") == "mismatch"),
         "Verified skipped: %d" % sum(1 for row in enriched_rows if row.get("verification_status") == "skipped"),
+        "Observed workload types: sql=%d plsql=%d"
+        % (
+            sum(1 for row in enriched_rows if str(row.get("replay_workload_type") or "sql") != "plsql"),
+            sum(1 for row in enriched_rows if str(row.get("replay_workload_type") or "sql") == "plsql"),
+        ),
+        "",
+        "Top slow SQL:",
+    ]
+    for idx, row in enumerate(top_sql_rows, 1):
+        summary_lines.append(
+            "%d. sql_id=%s ob_us=%s sql=%s"
+            % (
+                idx,
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                build_sql_preview(row.get("sql_text"), limit=120),
+            )
+        )
+    summary_lines.extend(
+        [
+            "",
+            "Top slow PL/SQL:",
+        ]
+    )
+    for idx, row in enumerate(top_plsql_rows, 1):
+        summary_lines.append(
+            "%d. sql_id=%s ob_us=%s plsql_diag=%s sql=%s"
+            % (
+                idx,
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                summarize_plsql_profile_diagnosis(row),
+                build_sql_preview(row.get("sql_text"), limit=120),
+            )
+        )
+    summary_lines.extend(
+        [
         "",
         "Top regressions:",
     ]
+    )
     for idx, row in enumerate(selected_rows, 1):
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
         verification_status = summarize_verification_evidence(row)
@@ -5673,6 +5905,23 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 sql=html.escape(str(row.get("sql_text") or "")),
             )
         )
+    slow_sql_rows_html = "".join(
+        "<tr><td>{sql_id}</td><td>{elapsed}</td><td><pre>{sql}</pre></td></tr>".format(
+            sql_id=html.escape(str(row.get("sql_id"))),
+            elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
+        )
+        for row in top_sql_rows
+    )
+    slow_plsql_rows_html = "".join(
+        "<tr><td>{sql_id}</td><td>{elapsed}</td><td>{diag}</td><td><pre>{sql}</pre></td></tr>".format(
+            sql_id=html.escape(str(row.get("sql_id"))),
+            elapsed=html.escape(str(row.get("ob_elapsed_us"))),
+            diag=html.escape(summarize_plsql_profile_diagnosis(row)),
+            sql=html.escape(build_sql_preview(row.get("sql_text"), limit=240)),
+        )
+        for row in top_plsql_rows
+    )
     charts_html = _render_svg_distribution_chart(enriched_rows, "distribution-chart")
     charts_html += _render_svg_timing_chart(selected_rows, "timing-chart", source_only=False)
     html_content = """<!DOCTYPE html>
@@ -5688,14 +5937,47 @@ svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 </style></head><body>
 <h1>perf_comparator report</h1>
 <p>Run ID: %s</p>
+<p>Mode: %s</p>
 %s
+<div id="slow-sql-section" class="chart-block">
+<h2>Top Slow SQL</h2>
+<table><thead><tr><th>SQL ID</th><th>OB Elapsed (us)</th><th>SQL</th></tr></thead><tbody>%s</tbody></table>
+</div>
+<div id="slow-plsql-section" class="chart-block">
+<h2>Top Slow PL/SQL</h2>
+<table><thead><tr><th>SQL ID</th><th>OB Elapsed (us)</th><th>Diagnosis</th><th>PL/SQL</th></tr></thead><tbody>%s</tbody></table>
+</div>
 <table>
 <thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Baseline Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
 <tbody>%s</tbody></table></body></html>
-""" % (html.escape(run_id), charts_html, "".join(html_rows))
+""" % (
+        html.escape(run_id),
+        html.escape("oracle-to-ob-rolling" if rolling_mode else "oracle-to-ob"),
+        charts_html,
+        slow_sql_rows_html,
+        slow_plsql_rows_html,
+        "".join(html_rows),
+    )
     write_text(html_path, html_content)
 
     hints_lines = ["-- perf_comparator recommendations", "-- run_id: %s" % run_id, ""]
+    hints_lines.append("-- slow_sql:")
+    for row in top_sql_rows:
+        hints_lines.append(
+            "-- sql_id=%s ob_elapsed_us=%s"
+            % (row.get("sql_id"), row.get("ob_elapsed_us"))
+        )
+    hints_lines.append("-- slow_plsql:")
+    for row in top_plsql_rows:
+        hints_lines.append(
+            "-- sql_id=%s ob_elapsed_us=%s diagnosis=%s"
+            % (
+                row.get("sql_id"),
+                row.get("ob_elapsed_us"),
+                summarize_plsql_profile_diagnosis(row),
+            )
+        )
+    hints_lines.append("")
     for row in selected_rows:
         hints_lines.append("-- sql_id: %s" % row.get("sql_id"))
         if row.get("verification_status"):
@@ -5756,6 +6038,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         1 for row in enriched_rows if not is_missing_sql_text(row.get("sql_text"))
     )
     missing_sql_stmt_count = max(0, len(enriched_rows) - visible_sql_stmt_count)
+    visibility_warning = build_query_sql_visibility_warning(config)
     sql_source_counts = compute_sql_text_source_distribution(enriched_rows)
     actor_summaries = compute_source_actor_summaries(enriched_rows)
     rolling_mode = bool(config.settings.get("_rolling_source_report"))
@@ -5822,6 +6105,16 @@ def generate_report_from_source_workload(config, workload_path, run_id):
             int(sql_source_counts.get("ocp_native", 0)),
             int(sql_source_counts.get("ocp_template", 0)),
         ),
+    ]
+    if visibility_warning:
+        summary_lines.extend(
+            [
+                visibility_warning,
+                "",
+            ]
+        )
+    summary_lines.extend(
+        [
         "Observed caller groups: %d (fields=%s)"
         % (
             len(actor_summaries),
@@ -5835,6 +6128,7 @@ def generate_report_from_source_workload(config, workload_path, run_id):
         "",
         "Top caller groups:",
     ]
+    )
     for idx, actor in enumerate(actor_summaries[:5], 1):
         summary_lines.append(
             "%d. actor=%s samples=%s total_elapsed_us=%s statements=%s sql=%s plsql=%s"
@@ -5993,6 +6287,12 @@ def generate_report_from_source_workload(config, workload_path, run_id):
     charts_html = _render_svg_distribution_chart(enriched_rows, "source-distribution-chart")
     charts_html += _render_svg_sql_source_chart(sql_source_counts, "sql-source-chart")
     charts_html += _render_svg_timing_chart(selected_rows, "source-timing-chart", source_only=True)
+    warning_html = ""
+    if visibility_warning:
+        warning_html = (
+            '<div id="query-sql-visibility-warning" class="warning-block"><strong>%s</strong></div>'
+            % html.escape(visibility_warning)
+        )
     html_content = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>perf_comparator source report</title>
 <style>
@@ -6002,12 +6302,14 @@ th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
 th { background: #f4f4f4; text-align: left; }
 pre { white-space: pre-wrap; margin: 0; }
  .chart-block { margin-bottom: 20px; }
+ .warning-block { border: 1px solid #c53030; background: #fff5f5; color: #742a2a; padding: 12px; margin: 0 0 20px 0; }
  svg text { font-family: Arial, sans-serif; fill: #1a202c; }
 </style></head><body>
 <h1>perf_comparator source-only report</h1>
 <p>Run ID: %s</p>
 <p>Mode: source-only</p>
 <p>Caller fields: %s</p>
+%s
 %s
 <div id="top-caller-groups" class="chart-block">
 <h2>Top Caller Groups</h2>
@@ -6027,6 +6329,7 @@ pre { white-space: pre-wrap; margin: 0; }
 """ % (
         html.escape(run_id),
         html.escape(",".join(get_source_actor_fields(config))),
+        warning_html,
         charts_html,
         caller_rows_html,
         slow_sql_rows_html,
@@ -6055,6 +6358,8 @@ pre { white-space: pre-wrap; margin: 0; }
             int(sql_source_counts.get("ocp_template", 0)),
         )
     )
+    if visibility_warning:
+        hints_lines.append("-- sql_visibility_warning: %s" % visibility_warning)
     if missing_sql_stmt_count > 0:
         hints_lines.append(
             "-- sql_text_note: configure [%s] and _enable_sql_audit_query_sql=true when QUERY_SQL is hidden from ordinary users"
@@ -6529,6 +6834,12 @@ def build_argument_parser():
         help="Drop the built-in profiler test package after verify-realdb completes",
     )
     parser.add_argument("--top-n", type=int, default=None, help="Override top-N regression count")
+    parser.add_argument(
+        "--capture-top-n",
+        type=int,
+        default=None,
+        help="Override Oracle capture breadth independently from report Top N",
+    )
     parser.add_argument("--min-exec", type=int, default=None, help="Override minimum execution count")
     parser.add_argument("--hours", type=int, default=None, help="Override Oracle capture time window")
     parser.add_argument(
@@ -6545,7 +6856,7 @@ def build_argument_parser():
         "--rolling-report-interval",
         type=int,
         default=None,
-        help="Override rolling source-report refresh interval in seconds (0 disables live refresh)",
+        help="Override rolling report refresh interval in seconds for source-report and stream live monitoring",
     )
     parser.add_argument(
         "--audit-poll-ms", type=int, default=None, help="Override SQL Audit poll interval in ms"
@@ -6562,6 +6873,7 @@ def apply_cli_overrides(config, args):
     # type: (AppConfig, argparse.Namespace) -> None
     overrides = {
         "top_n": args.top_n,
+        "capture_top_n": getattr(args, "capture_top_n", None),
         "min_exec": args.min_exec,
         "hours": args.hours,
         "duration": args.duration,
@@ -6604,6 +6916,7 @@ def main(argv=None):
     _print_preflight(preflight)
     if not preflight.ok:
         return 2
+    emit_prominent_runtime_warnings(config, args.mode)
 
     run_id = generate_run_id()
     if args.mode == MODE_CHECK_CONFIG:
@@ -6638,10 +6951,13 @@ def main(argv=None):
             LOG.info("Source-report run complete: workload=%s summary=%s", workload_path, report_paths["summary"])
             return 0
         if args.mode == MODE_STREAM:
-            workload_path = stream_capture_workload(config, args, run_id)
-            replay_path = replay_workload(config, workload_path, run_id)
-            report_paths = generate_report_from_replay(config, replay_path, run_id, workload_path)
-            LOG.info("Stream run complete: workload=%s replay=%s summary=%s", workload_path, replay_path, report_paths["summary"])
+            stream_paths = run_stream_monitor_pipeline(config, args, run_id)
+            LOG.info(
+                "Stream run complete: workload=%s replay=%s summary=%s",
+                stream_paths["workload"],
+                stream_paths["replay"],
+                stream_paths["summary"],
+            )
             return 0
         if args.mode == MODE_REPLAY_ONLY:
             replay_path = replay_workload(config, args.workload, run_id)

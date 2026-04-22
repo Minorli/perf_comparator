@@ -31,6 +31,7 @@ workloads_dir = workloads
 report_dir = reports
 log_level = INFO
 top_n = 50
+capture_top_n = 1000
 min_exec = 5
 hours = 24
 interval = 60
@@ -68,11 +69,16 @@ obdiag_timeout = 120
 # - Use [OCEANBASE_SOURCE] for OceanBase source capture.
 # - Use [OCEANBASE_SOURCE_SYS] for source-only diagnosis when ordinary users cannot
 #   read QUERY_SQL from GV$OB_SQL_AUDIT on OB 4.2.5.
+# - If [OCEANBASE_SOURCE].user_string is not SYS, the runtime will emit a prominent warning
+#   because QUERY_SQL may be hidden; prefer SYS or configure [OCEANBASE_SOURCE_SYS].
 # - Set [SETTINGS].wcr_path or pass --wcr-path when replaying from a WCR export file.
 # - Set plsql_profile=true to collect DBMS_PROFILER evidence; the runtime will lazily
 #   initialize profiler objects with DBMS_PROFILER.OB_INIT_OBJECTS(FALSE).
+# - capture_top_n controls Oracle capture breadth independently from report Top N. Use a
+#   larger value for 24h stream monitoring so new SQL / PL/SQL fingerprints are not missed.
 # - rolling_report_interval controls how often source-report refreshes the same HTML/TXT/SQL
-#   artifacts while capture is still running. Set it to 0 to disable live snapshots.
+#   artifacts while capture is still running. Stream live monitoring also uses it to refresh
+#   rolling Oracle->OB reports. Set it to 0 to disable live snapshots.
 # - source_actor_fields controls how source-report groups caller identity into testing-team
 #   buckets. Defaults work well for OB 4.2.5 audit attribution.
 # - Native OCP mode uses ocp_base_url + ocp_authorization_env + ocp_cluster_id +

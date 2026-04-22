@@ -15,7 +15,7 @@
   - Oracle 捕获 -> OB 回放 -> 报告
   - 也支持 `--sql-file` 和 `--wcr-path`
 - `stream`
-  - Oracle `V$SQL` 增量追踪
+  - Oracle `V$SQL` 增量追踪，并可在长时间运行时滚动回放到 OB、滚动刷新报告
 - `replay-only`
   - 直接消费已有 workload JSONL，生成 replay JSONL
 - `report-only`
@@ -120,6 +120,7 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 8
 - `workloads_dir`
 - `report_dir`
 - `top_n`
+- `capture_top_n`
 - `hours`
 - `slowdown_threshold`
 - `plsql_profile`
@@ -201,6 +202,34 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 8
 
 这样在多个测试部门同时压测时，最终报告会按 caller group 归类慢 SQL 和慢 PL/SQL，并尽量给出 RPC、分布式计划、热点代码块等原因。
 
+## Oracle -> OB 长跑监控
+
+如果客户是在 Oracle 上持续跑业务测试，希望工具后台持续抓取 Oracle 新负载并回放到 OB，推荐：
+
+```bash
+python3 perf_comparator.py --mode stream --config config.ini --duration 86400 --interval 60 --rolling-report-interval 300 --capture-top-n 1000
+```
+
+建议配置：
+
+- `[ORACLE_SOURCE]`
+- `[OCEANBASE_TARGET]`
+- `capture_top_n = 1000` 或更高
+- `top_n = 50`
+- `plsql_profile = true`
+
+这个模式会：
+
+- 持续从 Oracle `V$SQL` 捕获新的 SQL / PL/SQL 指纹
+- 对新增指纹实时回放到 OceanBase
+- 持续刷新同一组 HTML/TXT/SQL 报告文件
+- 在 replay 报告中分开显示慢 SQL 和慢 PL/SQL
+
+注意：
+
+- 这是“新增指纹持续监控”，不是逐执行审计
+- 如果是 OceanBase 源端抓取，非 `SYS` 登录经常看不到 `QUERY_SQL`，程序会在启动时显著警告；建议直接使用 `SYS`，或者配置 `[OCEANBASE_SOURCE_SYS]` 并检查 `_enable_sql_audit_query_sql=true`
+
 ## 产物
 
 `workloads/` 下常见文件：
@@ -224,7 +253,7 @@ python3 perf_comparator.py --mode source-report --config config.ini --duration 8
 ```bash
 python3 -m py_compile perf_comparator.py test_perf_comparator.py
 python3 -m unittest -v
-openspec validate --type change add-rolling-ob-source-diagnostics --strict --no-interactive
+openspec validate --type change add-rolling-oracle-ob-monitoring --strict --no-interactive
 ```
 
 ## 参考文档

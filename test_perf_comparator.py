@@ -387,6 +387,7 @@ class PerfComparatorConfigTests(unittest.TestCase):
                     [SETTINGS]
                     source_db_mode = oceanbase
                     source_schemas = APP
+                    capture_top_n = 1000
                     rolling_report_interval = 120
                     source_actor_fields = tenant_name,db_name,user_name,user_client_ip
                     """
@@ -399,6 +400,7 @@ class PerfComparatorConfigTests(unittest.TestCase):
                 str(config_path), execution_mode=perf_comparator.MODE_SOURCE_REPORT
             )
 
+            self.assertEqual(cfg.settings["capture_top_n"], 1000)
             self.assertEqual(cfg.settings["rolling_report_interval"], 120)
             self.assertEqual(
                 cfg.settings["source_actor_fields"],
@@ -1548,6 +1550,25 @@ class PerfComparatorObclientTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(any("source obclient" in item.lower() for item in result.errors))
+
+    def test_validate_runtime_paths_warns_when_non_sys_ob_source_may_hide_query_sql(self):
+        cfg = perf_comparator.AppConfig(
+            oracle_source={},
+            oceanbase_source={
+                "executable": "/bin/echo",
+                "host": "127.0.0.2",
+                "port": "2883",
+                "user_string": "app@test#obcluster",
+                "password": "secret",
+            },
+            oceanbase_target={},
+            settings={"source_db_mode": "oceanbase", "ob_session_query_timeout_us": 0, "source_schemas": ["APP"]},
+            config_path="config.ini",
+        )
+
+        result = perf_comparator.validate_runtime_paths(cfg)
+
+        self.assertTrue(any("QUERY_SQL visibility warning" in item for item in result.warnings))
 
     def test_probe_replay_capabilities_surfaces_optional_external_diagnostics(self):
         cfg = perf_comparator.AppConfig(
@@ -3089,6 +3110,147 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertEqual(rows[0]["sql_id"], "sql-1")
             self.assertEqual(rows[1]["sql_id"], "sql-2")
 
+    def test_run_stream_monitor_pipeline_replays_new_fingerprints_and_refreshes_reports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.ini"
+            workloads_dir = Path(tmpdir) / "workloads"
+            report_dir = Path(tmpdir) / "reports"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    duration = 2
+                    interval = 1
+                    rolling_report_interval = 60
+                    """
+                ).strip().format(workloads_dir=workloads_dir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            first = [
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT 1 FROM dual",
+                    "captured_at": "2026-04-22T10:00:00",
+                    "schema": "APP",
+                    "oracle_avg_elapsed_us": 1000.0,
+                    "oracle_avg_logical_reads": 10.0,
+                    "oracle_plan_hash": "a",
+                },
+                {
+                    "sql_id": "pkg-1",
+                    "sql_text": "BEGIN test_pkg.run_job; END",
+                    "captured_at": "2026-04-22T10:00:00",
+                    "schema": "APP",
+                    "oracle_avg_elapsed_us": 3000.0,
+                    "oracle_avg_logical_reads": 4.0,
+                    "oracle_plan_hash": "b",
+                },
+            ]
+            second = [
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT 1 FROM dual",
+                    "captured_at": "2026-04-22T10:00:01",
+                    "schema": "APP",
+                    "oracle_avg_elapsed_us": 1100.0,
+                    "oracle_avg_logical_reads": 11.0,
+                    "oracle_plan_hash": "a2",
+                },
+                {
+                    "sql_id": "sql-2",
+                    "sql_text": "SELECT 2 FROM dual",
+                    "captured_at": "2026-04-22T10:00:01",
+                    "schema": "APP",
+                    "oracle_avg_elapsed_us": 900.0,
+                    "oracle_avg_logical_reads": 8.0,
+                    "oracle_plan_hash": "c",
+                },
+            ]
+
+            config = perf_comparator.load_config(str(config_path))
+            mock_connection = mock.Mock()
+
+            def _fake_replay(config, workload_row, audit_collector=None, backend=None):
+                return {
+                    "sql_id": workload_row["sql_id"],
+                    "sql_text": workload_row["sql_text"],
+                    "ob_status": "ok",
+                    "ob_elapsed_us": workload_row["oracle_avg_elapsed_us"] * 1.2,
+                    "baseline_avg_elapsed_us": workload_row["oracle_avg_elapsed_us"],
+                    "oracle_avg_elapsed_us": workload_row["oracle_avg_elapsed_us"],
+                    "oracle_avg_logical_reads": workload_row["oracle_avg_logical_reads"],
+                    "replayed_at": "2026-04-22T10:00:02",
+                    "recommendations": [],
+                }
+
+            with mock.patch.object(
+                perf_comparator,
+                "probe_oracle_capabilities",
+                return_value={"awr": False, "vsql": True, "oracle_driver_available": True},
+            ), mock.patch.object(
+                perf_comparator,
+                "probe_replay_capabilities",
+                return_value={"obclient": True, "connectivity_ok": True, "explain": True, "sql_audit": False},
+            ), mock.patch.object(
+                perf_comparator,
+                "_open_oracle_connection",
+                return_value=mock_connection,
+            ), mock.patch.object(
+                perf_comparator,
+                "_capture_from_vsql",
+                side_effect=[first, second],
+            ), mock.patch.object(
+                perf_comparator,
+                "replay_statement",
+                side_effect=_fake_replay,
+            ) as replay_mock, mock.patch.object(
+                perf_comparator,
+                "maybe_refresh_replay_report",
+                side_effect=[10.0, 20.0, 30.0],
+            ) as refresh_mock, mock.patch.object(
+                perf_comparator,
+                "generate_report_from_replay",
+                return_value={"summary": report_dir / "perf_report_20260422_rolling_summary.txt"},
+            ) as report_mock, mock.patch.object(
+                perf_comparator.time,
+                "sleep",
+                return_value=None,
+            ), mock.patch.object(
+                perf_comparator.time,
+                "time",
+                side_effect=[0.0, 1.0, 3.0],
+            ):
+                paths = perf_comparator.run_stream_monitor_pipeline(
+                    config,
+                    argparse.Namespace(duration=2, sql_file=None),
+                    "20260422_rolling",
+                )
+
+            self.assertEqual(replay_mock.call_count, 3)
+            self.assertEqual(refresh_mock.call_count, 3)
+            report_mock.assert_called_once()
+            workload_rows = perf_comparator.read_jsonl(paths["workload"])
+            replay_rows = perf_comparator.read_jsonl(paths["replay"])
+            self.assertEqual([row["sql_id"] for row in workload_rows], ["sql-1", "pkg-1", "sql-2"])
+            self.assertEqual([row["sql_id"] for row in replay_rows], ["sql-1", "pkg-1", "sql-2"])
+
     def test_batch_mode_from_sql_file_generates_full_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.ini"
@@ -3570,6 +3732,92 @@ class PerfComparatorCliTests(unittest.TestCase):
             self.assertIn("-- top_callers:", hints_text)
             self.assertIn("-- slow_plsql:", hints_text)
 
+    def test_replay_report_surfaces_top_sql_and_plsql_sections(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_181500.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_181500.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                [
+                    {
+                        "sql_id": "sql-live-1",
+                        "sql_text": "SELECT * FROM orders WHERE status = 'ACTIVE'",
+                        "sql_text_normalized": "SELECT * FROM ORDERS WHERE STATUS = 'ACTIVE'",
+                        "oracle_avg_elapsed_us": 1200.0,
+                        "oracle_avg_logical_reads": 40.0,
+                    },
+                    {
+                        "sql_id": "pkg-live-1",
+                        "sql_text": "BEGIN settlement_pkg.run_close_day; END",
+                        "sql_text_normalized": "BEGIN SETTLEMENT_PKG.RUN_CLOSE_DAY; END",
+                        "oracle_avg_elapsed_us": 4200.0,
+                        "oracle_avg_logical_reads": 10.0,
+                    },
+                ],
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                [
+                    {
+                        "sql_id": "sql-live-1",
+                        "sql_text": "SELECT * FROM orders WHERE status = 'ACTIVE'",
+                        "ob_status": "ok",
+                        "ob_elapsed_us": 2100.0,
+                        "baseline_avg_elapsed_us": 1200.0,
+                        "oracle_avg_elapsed_us": 1200.0,
+                        "oracle_avg_logical_reads": 40.0,
+                        "replayed_at": "2026-04-22T18:15:01",
+                    },
+                    {
+                        "sql_id": "pkg-live-1",
+                        "sql_text": "BEGIN settlement_pkg.run_close_day; END",
+                        "ob_status": "ok",
+                        "ob_elapsed_us": 7600.0,
+                        "baseline_avg_elapsed_us": 4200.0,
+                        "oracle_avg_elapsed_us": 4200.0,
+                        "oracle_avg_logical_reads": 10.0,
+                        "replayed_at": "2026-04-22T18:15:02",
+                        "plsql_profile_status": "ok",
+                        "plsql_profile_diagnosis_summary": "SETTLEMENT_PKG:88-95:row_by_row_sql_in_loop",
+                    },
+                ],
+            )
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={},
+                oceanbase_target={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.1",
+                    "port": "2881",
+                    "user_string": "root@test#obcluster",
+                    "password": "secret",
+                },
+                settings={
+                    "source_schemas": ["APP"],
+                    "workloads_dir": tmpdir,
+                    "report_dir": str(report_dir),
+                    "top_n": 50,
+                    "slowdown_threshold": 0.8,
+                },
+                config_path="config.ini",
+            )
+
+            report_paths = perf_comparator.generate_report_from_replay(
+                config, replay_path, "20260422_181500", workload_path
+            )
+
+            summary_text = Path(report_paths["summary"]).read_text(encoding="utf-8")
+            html_text = Path(report_paths["html"]).read_text(encoding="utf-8")
+            hints_text = Path(report_paths["hints"]).read_text(encoding="utf-8")
+            self.assertIn("Top slow SQL:", summary_text)
+            self.assertIn("Top slow PL/SQL:", summary_text)
+            self.assertIn("SETTLEMENT_PKG:88-95:row_by_row_sql_in_loop", summary_text)
+            self.assertIn('id="slow-sql-section"', html_text)
+            self.assertIn('id="slow-plsql-section"', html_text)
+            self.assertIn("-- slow_sql:", hints_text)
+            self.assertIn("-- slow_plsql:", hints_text)
+
 
 class PerfComparatorDocumentationTests(unittest.TestCase):
     def test_readme_exists_and_mentions_runtime_modes(self):
@@ -3654,6 +3902,66 @@ class PerfComparatorDocumentationTests(unittest.TestCase):
             self.assertIn("SQL text coverage:", summary_text)
             self.assertIn("OCEANBASE_SOURCE_SYS", summary_text)
             self.assertIn("_enable_sql_audit_query_sql", summary_text)
+
+    def test_generate_source_report_surfaces_query_sql_visibility_warning_for_non_sys_login(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_182000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "sql-risk-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "sql_text_normalized": "SELECT * FROM ORDERS",
+                    "baseline_avg_elapsed_us": 1200.0,
+                    "oracle_avg_elapsed_us": 1200.0,
+                    "oracle_avg_logical_reads": 20.0,
+                    "source_ob_queue_time_us": 30.0,
+                    "source_ob_get_plan_time_us": 20.0,
+                    "source_ob_execute_time_us": 1150.0,
+                    "source_ob_net_time_us": 800.0,
+                    "source_ob_plan_type_raw": "3",
+                    "source_ob_is_hit_plan": "1",
+                    "source_ob_is_executor_rpc": "0",
+                    "source_sql_text_source": "captured",
+                },
+            )
+            config = perf_comparator.AppConfig(
+                oracle_source={},
+                oceanbase_source={
+                    "executable": "/bin/echo",
+                    "host": "127.0.0.2",
+                    "port": "2883",
+                    "user_string": "app@test#obcluster",
+                    "password": "source_secret",
+                },
+                oceanbase_target={},
+                settings={
+                    "source_db_mode": "oceanbase",
+                    "source_schemas": ["APP"],
+                    "report_dir": str(report_dir),
+                    "slowdown_threshold": 0.8,
+                    "top_n": 20,
+                },
+                config_path="config.ini",
+            )
+
+            with mock.patch.object(
+                perf_comparator,
+                "collect_source_plan_monitor_rows",
+                return_value=[],
+            ):
+                report_paths = perf_comparator.generate_report_from_source_workload(
+                    config, workload_path, "20260422_182000"
+                )
+
+            summary_text = report_paths["summary"].read_text(encoding="utf-8")
+            html_text = report_paths["html"].read_text(encoding="utf-8")
+            hints_text = report_paths["hints"].read_text(encoding="utf-8")
+            self.assertIn("QUERY_SQL visibility warning:", summary_text)
+            self.assertIn("[OCEANBASE_SOURCE_SYS]", summary_text)
+            self.assertIn('id="query-sql-visibility-warning"', html_text)
+            self.assertIn("sql_visibility_warning", hints_text)
 
     def test_generate_source_report_skips_internal_perf_queries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
