@@ -3,6 +3,9 @@ Replay file: <REPLAY_PATH>
 Total statements: 1
 Successful statements: 1
 Failed statements: 0
+Verified matches: 0
+Verified mismatches: 0
+Verified skipped: 0
 
 Top regressions:
-1. sql_id=sql-1 speedup_ratio=0.333 baseline_us=1000.0 ob_us=3000.0 rules=SLOWDOWN,DIST-JOIN,PLAN-CHANGED
+1. sql_id=sql-1 speedup_ratio=0.333 baseline_us=1000.0 ob_us=3000.0 rules=SLOWDOWN,DIST-JOIN,PLAN-CHANGED verification=n/a monitor=n/a

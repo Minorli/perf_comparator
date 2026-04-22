@@ -268,6 +268,47 @@ class PerfComparatorUtilityTests(unittest.TestCase):
         self.assertEqual(rows[2]["operator"], "TABLE SCAN")
         self.assertEqual(rows[3]["name"], "ORDER_ITEMS")
 
+    def test_parse_plan_monitor_rows_extracts_operator_metrics(self):
+        stdout = (
+            "1\tHASH JOIN\t1000\t1024\t2048\t0\n"
+            "2\tTABLE SCAN\t500\t256\t512\t64"
+        )
+        rows = perf_comparator.parse_plan_monitor_rows(stdout)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["plan_line_id"], 1)
+        self.assertEqual(rows[0]["operator"], "HASH JOIN")
+        self.assertEqual(rows[1]["workarea_tempseg"], 64.0)
+
+    def test_verify_result_sets_match(self):
+        result = perf_comparator.verify_result_sets(
+            source_rows=[("A", 1), ("B", 2)],
+            target_rows=[("B", 2), ("A", 1)],
+            sample_limit=10,
+        )
+        self.assertEqual(result["status"], "match")
+        self.assertTrue(result["source_hash"])
+        self.assertEqual(result["mismatch_sample"], [])
+
+    def test_verify_result_sets_detects_mismatch(self):
+        result = perf_comparator.verify_result_sets(
+            source_rows=[("A", 1), ("B", 2)],
+            target_rows=[("A", 1), ("C", 3)],
+            sample_limit=10,
+        )
+        self.assertEqual(result["status"], "mismatch")
+        self.assertTrue(result["mismatch_sample"])
+
+    def test_verify_result_sets_skips_large_result(self):
+        source_rows = [(idx,) for idx in range(11)]
+        target_rows = [(idx,) for idx in range(11)]
+        result = perf_comparator.verify_result_sets(
+            source_rows=source_rows,
+            target_rows=target_rows,
+            sample_limit=10,
+        )
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "too_large")
+
     def test_build_recommendations_handles_plan_miss_lock_hot_and_plsql(self):
         row = {
             "sql_text": "BEGIN pkg.run(); END",
@@ -372,6 +413,129 @@ class PerfComparatorObclientTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(any("source obclient" in item.lower() for item in result.errors))
+
+
+class PerfComparatorReplayEvidenceTests(unittest.TestCase):
+    def _build_config(self, verify_results=False):
+        return perf_comparator.AppConfig(
+            oracle_source={"user": "u", "password": "p", "dsn": "127.0.0.1:1521/ORCL"},
+            oceanbase_source={},
+            oceanbase_target={
+                "executable": "/bin/echo",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@test#obcluster",
+                "password": "secret",
+            },
+            settings={
+                "source_schemas": ["APP"],
+                "verify_results": verify_results,
+                "result_sample_limit": 100,
+                "slowdown_threshold": 0.8,
+                "obclient_timeout": 5,
+                "ob_session_query_timeout_us": 0,
+                "timeout_factor": 3.0,
+                "workloads_dir": ".",
+            },
+            config_path="config.ini",
+        )
+
+    def test_replay_statement_attaches_verification_and_plan_monitor(self):
+        config = self._build_config(verify_results=True)
+        workload_row = {
+            "sql_id": "sql-1",
+            "sql_text": "SELECT * FROM orders",
+            "baseline_avg_elapsed_us": 1000.0,
+            "oracle_avg_elapsed_us": 1000.0,
+            "oracle_avg_logical_reads": 20.0,
+        }
+        backend = mock.Mock()
+        backend.execute.return_value = (True, "ok", "")
+        backend.explain.return_value = (
+            True,
+            "|0 |PX COORDINATOR|\n|1 |HASH JOIN|",
+            "",
+        )
+
+        with mock.patch.object(
+            perf_comparator,
+            "_query_recent_audit_row",
+            return_value={
+                "ob_elapsed_us": 3000.0,
+                "ob_net_time_us": 2100.0,
+                "ob_plan_type_raw": "3",
+                "ob_is_hit_plan": "1",
+                "ob_is_executor_rpc": "0",
+                "ob_logical_reads": 60.0,
+                "trace_id": "trace-1",
+            },
+        ), mock.patch.object(
+            perf_comparator,
+            "perform_result_verification",
+            return_value={
+                "status": "mismatch",
+                "reason": "",
+                "source_hash": "src-hash",
+                "target_hash": "tgt-hash",
+                "artifact_path": "/tmp/mismatch.jsonl",
+                "mismatch_sample": [{"source": "A", "target": "B"}],
+            },
+        ) as verify_mock, mock.patch.object(
+            perf_comparator,
+            "collect_plan_monitor_rows",
+            return_value=[
+                {
+                    "plan_line_id": 1,
+                    "operator": "HASH JOIN",
+                    "output_rows": 1000.0,
+                    "workarea_mem": 1024.0,
+                    "workarea_max_mem": 2048.0,
+                    "workarea_tempseg": 64.0,
+                }
+            ],
+        ) as monitor_mock:
+            replay_row = perf_comparator.replay_statement(config, workload_row, backend=backend)
+
+        verify_mock.assert_called_once()
+        monitor_mock.assert_called_once()
+        self.assertEqual(replay_row["verification_status"], "mismatch")
+        self.assertEqual(replay_row["verification_artifact_path"], "/tmp/mismatch.jsonl")
+        self.assertEqual(replay_row["verification_source_hash"], "src-hash")
+        self.assertEqual(replay_row["plan_monitor_rows"][0]["operator"], "HASH JOIN")
+
+    def test_replay_statement_skips_plan_monitor_without_evidence_gate(self):
+        config = self._build_config(verify_results=False)
+        workload_row = {
+            "sql_id": "sql-1",
+            "sql_text": "SELECT * FROM orders",
+            "baseline_avg_elapsed_us": 3000.0,
+            "oracle_avg_elapsed_us": 3000.0,
+            "oracle_avg_logical_reads": 20.0,
+        }
+        backend = mock.Mock()
+        backend.execute.return_value = (True, "ok", "")
+        backend.explain.return_value = (True, "|0 |TABLE SCAN|", "")
+
+        with mock.patch.object(
+            perf_comparator,
+            "_query_recent_audit_row",
+            return_value={
+                "ob_elapsed_us": 1000.0,
+                "ob_net_time_us": 50.0,
+                "ob_plan_type_raw": "1",
+                "ob_is_hit_plan": "1",
+                "ob_is_executor_rpc": "0",
+                "ob_logical_reads": 20.0,
+            },
+        ), mock.patch.object(
+            perf_comparator,
+            "collect_plan_monitor_rows",
+        ) as monitor_mock:
+            replay_row = perf_comparator.replay_statement(config, workload_row, backend=backend)
+
+        monitor_mock.assert_not_called()
+        self.assertEqual(replay_row.get("plan_monitor_rows"), [])
+        self.assertNotIn("verification_status", replay_row)
 
 
 class PerfComparatorCliTests(unittest.TestCase):
@@ -542,6 +706,78 @@ class PerfComparatorCliTests(unittest.TestCase):
             actual = actual.replace(str(replay_path), "<REPLAY_PATH>")
             expected = fixture_path.read_text(encoding="utf-8").strip()
             self.assertEqual(actual, expected)
+
+    def test_report_only_mode_surfaces_verification_and_plan_monitor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workload_path = Path(tmpdir) / "workload_20260422_153000.jsonl"
+            replay_path = Path(tmpdir) / "replay_20260422_153000.jsonl"
+            report_dir = Path(tmpdir) / "reports"
+            perf_comparator.append_jsonl(
+                workload_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "baseline_avg_elapsed_us": 1000.0,
+                    "baseline_avg_logical_reads": 20.0,
+                    "oracle_plan_hash": "ora-1",
+                },
+            )
+            perf_comparator.append_jsonl(
+                replay_path,
+                {
+                    "sql_id": "sql-1",
+                    "sql_text": "SELECT * FROM orders",
+                    "ob_status": "ok",
+                    "ob_elapsed_us": 3000.0,
+                    "ob_logical_reads": 60.0,
+                    "ob_net_time_us": 2100.0,
+                    "ob_plan_hash": "ob-1",
+                    "verification_status": "mismatch",
+                    "plan_monitor_rows": [
+                        {
+                            "plan_line_id": 1,
+                            "operator": "HASH JOIN",
+                            "output_rows": 1000.0,
+                            "workarea_mem": 1024.0,
+                            "workarea_max_mem": 2048.0,
+                            "workarea_tempseg": 64.0,
+                        }
+                    ],
+                },
+            )
+            config_path = Path(tmpdir) / "config.ini"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [ORACLE_SOURCE]
+                    user = scott
+                    password = tiger
+                    dsn = 127.0.0.1:1521/ORCL
+
+                    [OCEANBASE_TARGET]
+                    executable = /bin/echo
+                    host = 127.0.0.1
+                    port = 2881
+                    user_string = root@test#obcluster
+                    password = secret
+
+                    [SETTINGS]
+                    source_schemas = APP
+                    workloads_dir = {workloads_dir}
+                    report_dir = {report_dir}
+                    """
+                ).strip().format(workloads_dir=tmpdir, report_dir=report_dir)
+                + "\n",
+                encoding="utf-8",
+            )
+            exit_code = perf_comparator.main(
+                ["--mode", "report-only", "--config", str(config_path), "--replay", str(replay_path)]
+            )
+            self.assertEqual(exit_code, 0)
+            html_path = next(report_dir.glob("perf_report_*.html"))
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn("verification=mismatch", html_text)
+            self.assertIn("monitor=HASH JOIN", html_text)
 
     def test_stream_mode_appends_only_new_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -62,6 +62,7 @@ ARTIFACT_SPECS = {
     "capture_capability": ("capture_capability", ".json"),
     "replay_capability": ("replay_capability", ".json"),
     "plsql_profile": ("plsql_profile", ".jsonl"),
+    "mismatch": ("mismatch", ".jsonl"),
     "report_html": ("perf_report", ".html"),
     "report_summary": ("perf_report", "_summary.txt"),
     "report_hints": ("perf_hints", ".sql"),
@@ -405,6 +406,9 @@ def load_config(config_path):
             settings_section, "audit_poll_ms", DEFAULT_AUDIT_POLL_MS
         ),
         "duration": _get_optional_int(settings_section, "duration", 0),
+        "verify_results": str(settings_section.get("verify_results") or "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+        "result_sample_limit": _get_optional_int(settings_section, "result_sample_limit", 10000),
         "obclient_timeout": _get_optional_int(
             settings_section, "obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT
         ),
@@ -660,6 +664,235 @@ def parse_explain_plan_text(plan_text):
     return rows
 
 
+def parse_plan_monitor_rows(stdout_text):
+    # type: (str) -> List[Dict[str, Any]]
+    rows = []
+    for line in (stdout_text or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 6:
+            continue
+        try:
+            plan_line_id = int(fields[0])
+        except (TypeError, ValueError):
+            continue
+        rows.append(
+            {
+                "plan_line_id": plan_line_id,
+                "operator": fields[1],
+                "output_rows": _safe_float(fields[2]),
+                "workarea_mem": _safe_float(fields[3]),
+                "workarea_max_mem": _safe_float(fields[4]),
+                "workarea_tempseg": _safe_float(fields[5]),
+            }
+        )
+    return rows
+
+
+def _normalize_result_row(row):
+    # type: (Any) -> str
+    if isinstance(row, (list, tuple)):
+        values = row
+    else:
+        values = [row]
+    return "\x1f".join("" if value is None else str(value) for value in values)
+
+
+def verify_result_sets(source_rows, target_rows, sample_limit):
+    # type: (Iterable[Any], Iterable[Any], int) -> Dict[str, Any]
+    source_list = list(source_rows)
+    target_list = list(target_rows)
+    sample_limit = max(1, int(sample_limit or 1))
+    if len(source_list) > sample_limit or len(target_list) > sample_limit:
+        return {
+            "status": "skipped",
+            "reason": "too_large",
+            "source_hash": "",
+            "target_hash": "",
+            "mismatch_sample": [],
+        }
+    normalized_source = sorted(_normalize_result_row(row) for row in source_list)
+    normalized_target = sorted(_normalize_result_row(row) for row in target_list)
+    source_hash = hashlib.md5("\n".join(normalized_source).encode("utf-8")).hexdigest()
+    target_hash = hashlib.md5("\n".join(normalized_target).encode("utf-8")).hexdigest()
+    if source_hash == target_hash:
+        return {
+            "status": "match",
+            "reason": "",
+            "source_hash": source_hash,
+            "target_hash": target_hash,
+            "mismatch_sample": [],
+        }
+    mismatch_sample = []
+    max_rows = max(len(normalized_source), len(normalized_target))
+    for idx in range(max_rows):
+        src = normalized_source[idx] if idx < len(normalized_source) else None
+        tgt = normalized_target[idx] if idx < len(normalized_target) else None
+        if src != tgt:
+            mismatch_sample.append({"source": src, "target": tgt})
+        if len(mismatch_sample) >= min(20, sample_limit):
+            break
+    return {
+        "status": "mismatch",
+        "reason": "",
+        "source_hash": source_hash,
+        "target_hash": target_hash,
+        "mismatch_sample": mismatch_sample,
+    }
+
+
+def is_select_statement(sql_text):
+    # type: (str) -> bool
+    normalized = normalize_sql_text(sql_text)
+    return normalized.startswith("SELECT ") or normalized.startswith("WITH ")
+
+
+def _fetch_source_rows(config, sql_text):
+    # type: (AppConfig, str) -> List[Any]
+    if config.settings.get("source_db_mode") == SOURCE_DB_MODE_OCEANBASE:
+        ok, stdout, stderr = _obclient_run_sql_on_source(
+            config,
+            sql_text,
+            timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+            session_query_timeout_us=config.settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+            ),
+        )
+        if not ok:
+            raise ConfigError("OceanBase source verification query failed: %s" % (stderr or stdout))
+        return [tuple(line.split("\t")) for line in (stdout or "").splitlines() if line.strip()]
+    connection = _open_oracle_connection(config)
+    try:
+        cursor = connection.cursor()
+        cursor.execute(sql_text)
+        rows = cursor.fetchall()
+        cursor.close()
+        return rows
+    finally:
+        connection.close()
+
+
+def _fetch_target_rows(config, sql_text):
+    # type: (AppConfig, str) -> List[Any]
+    ok, stdout, stderr = obclient_run_sql(
+        config.oceanbase_target,
+        sql_text,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok:
+        raise ConfigError("OceanBase target verification query failed: %s" % (stderr or stdout))
+    return [tuple(line.split("\t")) for line in (stdout or "").splitlines() if line.strip()]
+
+
+def perform_result_verification(config, workload_row, rendered_sql):
+    # type: (AppConfig, Dict[str, Any], str) -> Dict[str, Any]
+    sample_limit = int(config.settings.get("result_sample_limit", 10000) or 10000)
+    source_rows = _fetch_source_rows(config, rendered_sql)
+    target_rows = _fetch_target_rows(config, rendered_sql)
+    result = verify_result_sets(source_rows, target_rows, sample_limit)
+    if result.get("status") == "mismatch":
+        mismatch_path = build_artifact_path(
+            "mismatch",
+            generate_run_id(),
+            root_dir=config.settings["workloads_dir"],
+        )
+        append_jsonl(
+            mismatch_path,
+            {
+                "sql_id": workload_row.get("sql_id"),
+                "sql_text": workload_row.get("sql_text"),
+                "verification": result,
+                "captured_at": utc_now_iso(),
+            },
+        )
+        result["artifact_path"] = str(mismatch_path)
+    return result
+
+
+def collect_plan_monitor_rows(config, audit_row, rendered_sql):
+    # type: (AppConfig, Dict[str, Any], str) -> List[Dict[str, Any]]
+    trace_id = str(audit_row.get("trace_id") or "")
+    sql_text_snippet = normalize_sql_text(rendered_sql)[:80].replace("'", "''")
+    filters = []
+    if trace_id:
+        filters.append("TRACE_ID = '%s'" % trace_id.replace("'", "''"))
+    if sql_text_snippet:
+        filters.append(
+            "UPPER(REPLACE(REPLACE(REPLACE(STATEMENT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ')) LIKE '%%%s%%'"
+            % sql_text_snippet
+        )
+    where_clause = " OR ".join(filters) if filters else "1 = 0"
+    query = """
+        SELECT * FROM (
+          SELECT
+            PLAN_LINE_ID,
+            OPERATOR,
+            OUTPUT_ROWS,
+            WORKAREA_MEM,
+            WORKAREA_MAX_MEM,
+            WORKAREA_TEMPSEG
+          FROM GV$SQL_PLAN_MONITOR
+          WHERE {where_clause}
+          ORDER BY PLAN_LINE_ID
+        )
+    """.format(where_clause=where_clause)
+    ok, stdout, _ = obclient_run_sql(
+        config.oceanbase_target,
+        query,
+        timeout=config.settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT),
+        session_query_timeout_us=config.settings.get(
+            "ob_session_query_timeout_us", DEFAULT_OB_SESSION_QUERY_TIMEOUT_US
+        ),
+    )
+    if not ok:
+        return []
+    return parse_plan_monitor_rows(stdout)
+
+
+def should_collect_plan_monitor(row, slowdown_threshold):
+    # type: (Dict[str, Any], float) -> bool
+    if row.get("ob_status") != "ok":
+        return False
+    plan_type = str(row.get("ob_plan_type_raw") or "").strip().upper()
+    if plan_type == "3" or str(row.get("ob_plan_type") or "").strip().upper() == "DISTRIBUTED":
+        return True
+    speedup_ratio = row.get("speedup_ratio")
+    if speedup_ratio is not None and float(speedup_ratio) < float(slowdown_threshold):
+        return True
+    net_ratio = row.get("net_ratio")
+    if net_ratio is not None and float(net_ratio) > 0.6:
+        return True
+    return False
+
+
+def summarize_verification_evidence(row):
+    # type: (Dict[str, Any]) -> str
+    status = str(row.get("verification_status") or "n/a")
+    if status == "mismatch" and row.get("verification_artifact_path"):
+        return "%s:%s" % (status, row.get("verification_artifact_path"))
+    if status == "skipped" and row.get("verification_reason"):
+        return "%s:%s" % (status, row.get("verification_reason"))
+    return status
+
+
+def summarize_plan_monitor_evidence(row):
+    # type: (Dict[str, Any]) -> str
+    monitor_rows = row.get("plan_monitor_rows") or []
+    if not monitor_rows:
+        return "n/a"
+    operators = [
+        str(monitor_row.get("operator") or "").strip()
+        for monitor_row in monitor_rows[:3]
+        if str(monitor_row.get("operator") or "").strip()
+    ]
+    summary = ",".join(operators) or "n/a"
+    if any(float(monitor_row.get("workarea_tempseg") or 0.0) > 0.0 for monitor_row in monitor_rows):
+        summary = "%s|spill" % summary if summary != "n/a" else "spill"
+    return summary
+
+
 def sql_literal(value):
     # type: (Any) -> str
     if value is None:
@@ -894,6 +1127,26 @@ def build_recommendations(row, slowdown_threshold):
                 "rule_id": "READ-AMPLIFICATION",
                 "message": "OceanBase logical reads are significantly higher than Oracle",
                 "hint_sql": "-- Investigate index usage, partition pruning, and row filtering predicates",
+            }
+        )
+    if row.get("verification_status") == "mismatch":
+        recommendations.append(
+            {
+                "rule_id": "RESULT-MISMATCH",
+                "message": "Replay result set differs from the source result set",
+                "hint_sql": (
+                    "-- Inspect the mismatch artifact and compare semantics, collation, and implicit conversion behavior"
+                ),
+            }
+        )
+    if any(float(monitor_row.get("workarea_tempseg") or 0.0) > 0.0 for monitor_row in (row.get("plan_monitor_rows") or [])):
+        recommendations.append(
+            {
+                "rule_id": "PLAN-SPILL",
+                "message": "Plan monitor shows temp segment spill during execution",
+                "hint_sql": (
+                    "-- Review join/hash workarea sizing, data skew, and partition-locality before raising memory limits"
+                ),
             }
         )
     return recommendations
@@ -1621,7 +1874,7 @@ def _query_recent_audit_row(config, rendered_sql):
 def _query_recent_audit_row_by_sql_id(config, sql_id, rendered_sql):
     # type: (AppConfig, str, str) -> Dict[str, Any]
     if not sql_id:
-        return _query_recent_audit_row(config, rendered_sql)
+        return {}
     query = """
         SELECT * FROM (
           SELECT
@@ -1655,10 +1908,10 @@ def _query_recent_audit_row_by_sql_id(config, sql_id, rendered_sql):
         ),
     )
     if not ok or not stdout:
-        return _query_recent_audit_row(config, rendered_sql)
+        return {}
     fields = stdout.splitlines()[0].split("\t")
     if len(fields) < 16:
-        return _query_recent_audit_row(config, rendered_sql)
+        return {}
     return {
         "request_id": fields[0],
         "ob_elapsed_us": _safe_float(fields[1]),
@@ -1734,9 +1987,14 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
     audit_row = {}
     if audit_collector is not None:
         audit_collector.collect_once()
-        audit_row = audit_collector.match_for_sql(rendered_sql)
+        audit_row = audit_collector.match_for_workload(workload_row, rendered_sql)
     if not audit_row:
-        audit_row = _query_recent_audit_row(config, rendered_sql)
+        if workload_row.get("baseline_source_mode") == SOURCE_DB_MODE_OCEANBASE:
+            audit_row = _query_recent_audit_row_by_sql_id(
+                config, str(workload_row.get("sql_id") or ""), rendered_sql
+            )
+        elif not audit_row:
+            audit_row = _query_recent_audit_row(config, rendered_sql)
     replay_row = {
         "sql_id": workload_row.get("sql_id"),
         "sql_text": workload_row.get("sql_text"),
@@ -1761,12 +2019,42 @@ def replay_statement(config, workload_row, audit_collector=None, backend=None):
         "ob_plan_hash": compute_sql_id(explain_stdout) if explain_ok and explain_stdout else None,
         "replayed_at": started_at,
         "ob_stdout_preview": (stdout or "")[:500],
+        "plan_monitor_rows": [],
     }
     merged = dict(workload_row)
     merged.update(replay_row)
     merged.update(derive_replay_metrics(merged))
+    if (
+        ok
+        and config.settings.get("verify_results")
+        and is_select_statement(rendered_sql)
+    ):
+        try:
+            verification = perform_result_verification(config, workload_row, rendered_sql)
+        except Exception as exc:
+            verification = {
+                "status": "skipped",
+                "reason": "query_error:%s" % str(exc),
+                "source_hash": "",
+                "target_hash": "",
+                "artifact_path": "",
+                "mismatch_sample": [],
+            }
+        merged["verification_status"] = verification.get("status")
+        merged["verification_reason"] = verification.get("reason")
+        merged["verification_source_hash"] = verification.get("source_hash")
+        merged["verification_target_hash"] = verification.get("target_hash")
+        merged["verification_artifact_path"] = verification.get("artifact_path")
+        merged["verification_mismatch_sample"] = verification.get("mismatch_sample") or []
+    slowdown_threshold = float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
+    if should_collect_plan_monitor(merged, slowdown_threshold):
+        try:
+            merged["plan_monitor_rows"] = collect_plan_monitor_rows(config, audit_row, rendered_sql)
+        except Exception:
+            LOG.exception("Plan monitor collection failed for sql_id=%s", workload_row.get("sql_id"))
+            merged["plan_monitor_rows"] = []
     merged["recommendations"] = build_recommendations(
-        merged, slowdown_threshold=float(config.settings.get("slowdown_threshold", DEFAULT_SLOWDOWN_THRESHOLD))
+        merged, slowdown_threshold=slowdown_threshold
     )
     return merged
 
@@ -1844,13 +2132,18 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
         "Total statements: %d" % len(enriched_rows),
         "Successful statements: %d" % sum(1 for row in enriched_rows if row.get("ob_status") == "ok"),
         "Failed statements: %d" % sum(1 for row in enriched_rows if row.get("ob_status") != "ok"),
+        "Verified matches: %d" % sum(1 for row in enriched_rows if row.get("verification_status") == "match"),
+        "Verified mismatches: %d" % sum(1 for row in enriched_rows if row.get("verification_status") == "mismatch"),
+        "Verified skipped: %d" % sum(1 for row in enriched_rows if row.get("verification_status") == "skipped"),
         "",
         "Top regressions:",
     ]
     for idx, row in enumerate(selected_rows, 1):
         rule_ids = ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none"
+        verification_status = summarize_verification_evidence(row)
+        plan_monitor_summary = summarize_plan_monitor_evidence(row)
         summary_lines.append(
-            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s"
+            "%d. sql_id=%s speedup_ratio=%s baseline_us=%s ob_us=%s rules=%s verification=%s monitor=%s"
             % (
                 idx,
                 row.get("sql_id"),
@@ -1858,14 +2151,18 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                 row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us"),
                 row.get("ob_elapsed_us"),
                 rule_ids,
+                verification_status,
+                plan_monitor_summary,
             )
         )
     write_text(summary_path, "\n".join(summary_lines) + "\n")
 
     html_rows = []
     for row in selected_rows:
+        verification_status = summarize_verification_evidence(row)
+        plan_monitor_summary = summarize_plan_monitor_evidence(row)
         html_rows.append(
-            "<tr><td>{sql_id}</td><td>{speedup}</td><td>{oracle}</td><td>{ob}</td><td>{rules}</td><td><pre>{sql}</pre></td></tr>".format(
+            "<tr><td>{sql_id}</td><td>{speedup}</td><td>{oracle}</td><td>{ob}</td><td>{rules}</td><td>{evidence}</td><td><pre>{sql}</pre></td></tr>".format(
                 sql_id=html.escape(str(row.get("sql_id"))),
                 speedup=html.escape(_format_ratio(row.get("speedup_ratio"))),
                 oracle=html.escape(str(row.get("baseline_avg_elapsed_us") or row.get("oracle_avg_elapsed_us"))),
@@ -1876,6 +2173,13 @@ def generate_report_from_replay(config, replay_path, run_id, workload_path=None)
                         ",".join(item["rule_id"] for item in row.get("recommendations", [])) or "none",
                         " > ".join(plan_row.get("operator", "") for plan_row in row.get("ob_plan_rows", [])[:4]) or "n/a",
                         row.get("ob_plan_type") or "n/a",
+                    )
+                ),
+                evidence=html.escape(
+                    "verification=%s | monitor=%s"
+                    % (
+                        verification_status,
+                        plan_monitor_summary,
                     )
                 ),
                 sql=html.escape(str(row.get("sql_text") or "")),
@@ -1893,7 +2197,7 @@ pre { white-space: pre-wrap; margin: 0; }
 <h1>perf_comparator report</h1>
 <p>Run ID: %s</p>
 <table>
-<thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Baseline Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>SQL</th></tr></thead>
+<thead><tr><th>SQL ID</th><th>Speedup Ratio</th><th>Baseline Avg (us)</th><th>OB Elapsed (us)</th><th>Rules</th><th>Evidence</th><th>SQL</th></tr></thead>
 <tbody>%s</tbody></table></body></html>
 """ % (html.escape(run_id), "".join(html_rows))
     write_text(html_path, html_content)
@@ -1901,6 +2205,14 @@ pre { white-space: pre-wrap; margin: 0; }
     hints_lines = ["-- perf_comparator recommendations", "-- run_id: %s" % run_id, ""]
     for row in selected_rows:
         hints_lines.append("-- sql_id: %s" % row.get("sql_id"))
+        if row.get("verification_status"):
+            hints_lines.append(
+                "-- verification: %s" % summarize_verification_evidence(row)
+            )
+        if row.get("plan_monitor_rows"):
+            hints_lines.append(
+                "-- plan-monitor: %s" % summarize_plan_monitor_evidence(row)
+            )
         for item in row.get("recommendations", []):
             hints_lines.append("-- %s: %s" % (item["rule_id"], item["message"]))
             hints_lines.append(item["hint_sql"])
@@ -1929,6 +2241,17 @@ def build_argument_parser():
     parser.add_argument("--replay", help="Input replay JSONL for report-only mode")
     parser.add_argument("--sql-file", help="Input SQL file for manual capture in batch mode")
     parser.add_argument("--duration", type=int, default=None, help="Stream mode duration in seconds")
+    parser.add_argument(
+        "--verify-results",
+        action="store_true",
+        help="Enable result-set verification for replayed SELECT statements",
+    )
+    parser.add_argument(
+        "--result-sample-limit",
+        type=int,
+        default=None,
+        help="Maximum row count to verify before skipping result comparison",
+    )
     parser.add_argument("--top-n", type=int, default=None, help="Override top-N regression count")
     parser.add_argument("--min-exec", type=int, default=None, help="Override minimum execution count")
     parser.add_argument("--hours", type=int, default=None, help="Override Oracle capture time window")
@@ -1960,6 +2283,8 @@ def apply_cli_overrides(config, args):
         "min_exec": args.min_exec,
         "hours": args.hours,
         "duration": args.duration,
+        "verify_results": True if getattr(args, "verify_results", False) else None,
+        "result_sample_limit": getattr(args, "result_sample_limit", None),
         "timeout_factor": args.timeout_factor,
         "slowdown_threshold": args.slowdown_threshold,
         "interval": args.interval,
